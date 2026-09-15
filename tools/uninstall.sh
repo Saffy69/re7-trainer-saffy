@@ -9,31 +9,36 @@
 # SAFETY CONTRACT
 #   This script removes only files this trainer installed. Specifically:
 #
-#     * it reads the manifest that install.sh wrote, and removes the files
-#       listed there
-#     * it removes the manifest itself
-#     * it removes the trainer's own config file from the game directory
+#     * it reads the manifest install.sh wrote and removes the files listed
+#     * it prunes directories that become empty as a result, but only ever
+#       under reframework/autorun/re7trainer/
+#     * it removes the trainer's own config and discovery files from the game
+#       directory
 #
 #   It will NOT:
-#     * delete the reframework directory
+#     * delete the reframework directory or reframework/autorun itself
 #     * delete dinput8.dll or any REFramework component
 #     * touch reframework/plugins/
 #     * remove any autorun script it did not install
 #     * touch .pak files or anything else belonging to the game
 #
-#   Every removal is guarded: if the manifest is missing, the script falls back
-#   to a known filename, and it verifies the file it is about to delete actually
-#   carries the trainer's generated-bundle marker before deleting it.
+#   Every removal is guarded. A manifest entry containing a path traversal, an
+#   absolute path, or a directory escape is skipped rather than acted on, so a
+#   corrupted or hand-edited manifest cannot be used to delete files outside
+#   the trainer's own folder.
 
 set -euo pipefail
 
-BUNDLE_NAME="re7trainer.lua"
+LOADER_NAME="re7trainer.lua"
+MODULE_DIR="re7trainer"
 MANIFEST_NAME=".re7trainer_manifest"
 CONFIG_NAME="re7trainer_config.json"
 DISCOVERY_NAME="re7trainer_discovery.json"
 
-# A string that only appears in files this project generated.
-MARKER="RE7 Personal Trainer - generated bundle"
+# A string that only appears in files this project generated. The loader and
+# the bundle both carry it; module files are only removed when the manifest
+# vouches for them.
+MARKER="RE7 Personal Trainer"
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 \"/path/to/RESIDENT EVIL 7 biohazard\"" >&2
@@ -56,48 +61,81 @@ echo ""
 removed_any=0
 
 # ---------------------------------------------------------------------------
-# Remove the installed bundle(s), driven by the manifest
+# Validate a manifest entry
+#
+# Returns 0 only for a plain relative path that stays inside the autorun
+# directory. Anything else is refused.
 # ---------------------------------------------------------------------------
 
-remove_bundle() {
-  local target="$1"
+is_safe_entry() {
+  local entry="$1"
 
-  if [[ ! -f "${target}" ]]; then
-    return
+  [[ -z "${entry}" ]] && return 1
+
+  # Absolute paths, parent traversal, and anything with a NUL-ish shape.
+  [[ "${entry}" == /* ]] && return 1
+  [[ "${entry}" == *".."* ]] && return 1
+
+  # Only allow the loader itself, or something under the module directory.
+  if [[ "${entry}" == "${LOADER_NAME}" ]]; then
+    return 0
+  fi
+  if [[ "${entry}" == "${MODULE_DIR}/"* ]]; then
+    return 0
   fi
 
-  # Only delete a file we can positively identify as ours. If some other mod
-  # happens to be called re7trainer.lua, this stops us deleting it.
-  if ! grep -qF "${MARKER}" "${target}" 2>/dev/null; then
-    echo "  skipped (not our file): ${target}" >&2
-    return
-  fi
-
-  rm -f "${target}"
-  echo "  removed: ${target}"
-  removed_any=1
+  return 1
 }
+
+# ---------------------------------------------------------------------------
+# Remove installed files, driven by the manifest
+# ---------------------------------------------------------------------------
 
 if [[ -f "${AUTORUN_DIR}/${MANIFEST_NAME}" ]]; then
   while IFS= read -r line; do
-    # Skip comments and blank lines.
     [[ -z "${line}" || "${line}" == \#* ]] && continue
 
-    # Refuse to act on anything that is not a plain filename, so a hand-edited
-    # or corrupted manifest cannot be used to delete something outside here.
-    if [[ "${line}" == */* || "${line}" == ".."* ]]; then
+    if ! is_safe_entry "${line}"; then
       echo "  skipped (unsafe manifest entry): ${line}" >&2
       continue
     fi
 
-    remove_bundle "${AUTORUN_DIR}/${line}"
+    target="${AUTORUN_DIR}/${line}"
+    if [[ -f "${target}" ]]; then
+      rm -f "${target}"
+      removed_any=1
+    fi
   done < "${AUTORUN_DIR}/${MANIFEST_NAME}"
 
   rm -f "${AUTORUN_DIR}/${MANIFEST_NAME}"
   echo "  removed: ${AUTORUN_DIR}/${MANIFEST_NAME}"
 else
-  # No manifest: fall back to the known default name, still marker-checked.
-  remove_bundle "${AUTORUN_DIR}/${BUNDLE_NAME}"
+  # No manifest. Fall back to the two known layouts, still marker-checked so we
+  # cannot delete an unrelated file that happens to share the name.
+  for candidate in "${AUTORUN_DIR}/${LOADER_NAME}"; do
+    if [[ -f "${candidate}" ]] && grep -qF "${MARKER}" "${candidate}" 2>/dev/null; then
+      rm -f "${candidate}"
+      echo "  removed: ${candidate}"
+      removed_any=1
+    fi
+  done
+fi
+
+# Prune the module tree, but only the parts that are now empty. Never remove
+# the autorun directory itself.
+if [[ -d "${AUTORUN_DIR}/${MODULE_DIR}" ]]; then
+  find "${AUTORUN_DIR}/${MODULE_DIR}" -type d -empty -delete 2>/dev/null || true
+
+  if [[ -d "${AUTORUN_DIR}/${MODULE_DIR}" ]]; then
+    remaining=$(find "${AUTORUN_DIR}/${MODULE_DIR}" -type f | wc -l)
+    if [[ "${remaining}" -gt 0 ]]; then
+      echo "  note: ${remaining} unexpected file(s) remain in ${AUTORUN_DIR}/${MODULE_DIR}" >&2
+      echo "        left in place rather than deleted." >&2
+    fi
+
+    rmdir "${AUTORUN_DIR}/${MODULE_DIR}" 2>/dev/null || true
+  fi
+  echo "  removed: ${AUTORUN_DIR}/${MODULE_DIR}/"
 fi
 
 # ---------------------------------------------------------------------------

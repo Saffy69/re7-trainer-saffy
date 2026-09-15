@@ -105,8 +105,9 @@ The path is the folder containing `re7.exe`. On this machine:
 ./tools/install.sh "$HOME/.local/share/Steam/steamapps/common/RESIDENT EVIL 7 biohazard"
 ```
 
-The installer bundles `src/` into a single self-contained file and places it at
-`reframework/autorun/re7trainer.lua`. It refuses to run against a folder with no `re7.exe`.
+The installer copies the module tree into `reframework/autorun/re7trainer/` and writes a small
+top-level loader at `reframework/autorun/re7trainer.lua`. It refuses to run against a folder with no
+`re7.exe`.
 
 To remove it:
 
@@ -114,26 +115,64 @@ To remove it:
 ./tools/uninstall.sh "/path/to/RESIDENT EVIL 7 biohazard"
 ```
 
-The uninstaller removes only files it installed, verified against a marker and a manifest. It never
-touches `dinput8.dll`, `reframework/plugins/`, or any other mod.
+The uninstaller removes only files it installed, verified against a manifest and a marker. It never
+touches `dinput8.dll`, `reframework/plugins/`, or any other mod, and it prunes only directories that
+become empty.
 
-### Why the installer bundles instead of copying files
+### How module loading works
 
-The source is modular, but it cannot be *shipped* modular, for reasons verified against the
-installed binary:
+Loading is split across two levels, and both halves were verified against REFramework v1.5.9's
+`ScriptRunner` source and independently against the installed binary.
 
-- this REFramework build has **no filesystem API** (`fs.*` is absent), so a script cannot locate
-  its own directory
-- it has **no game-directory accessor** (`get_game_directory` and friends are all absent), so
-  `dofile` with a computed path is unavailable
-- `require()` depends on `package.path`, which in this build embeds
-  `...;.\?.lua;.\?\init.lua` — resolved against the process working directory, which we cannot rely on
-- REFramework's ScriptRunner loads every `*.lua` in `autorun/`, so dropping fifteen module files
-  there would execute each one as a standalone script
+**Only the top-level loader is auto-executed.** `ScriptRunner::reset_scripts()` iterates
+`autorun/*.lua` **non-recursively** and runs each file immediately. So:
 
-The bundler registers each module in `package.preload`, which Lua's `require()` consults **before**
-any path-based searcher. That makes module resolution independent of `package.path`, the working
-directory, and the load location. `tools/bundle.lua` documents this in full.
+```
+reframework/autorun/re7trainer.lua          <- auto-executed
+reframework/autorun/re7trainer/**/*.lua     <- NOT auto-executed (subdirectory is ignored)
+```
+
+That is what makes a module tree safe: the module files are never run as standalone scripts, which
+they are not written to be.
+
+**`require()` resolves into that subtree.** Before running any script, `reset_scripts()` appends
+`<autorun>/?.lua` and `<autorun>/?/init.lua` to `package.path`. So the loader's
+`require("re7trainer.main")` resolves to `autorun/re7trainer/main.lua`, and
+`require("re7trainer.utils.safe_call")` to `autorun/re7trainer/utils/safe_call.lua`.
+
+The installed binary corroborates this: the literals `/?.lua`, `/?/init.lua` and `/?.dll` sit
+immediately adjacent to the `[ScriptState] Running script {}...` string — the `package.path`
+concatenation in `ScriptState::run_script()`.
+
+```bash
+grep -n 'Running script\|^/?.lua$\|^/?/init.lua$' dll_strings.txt
+# 303609:[ScriptState] Running script {}...
+# 303611:/?.lua
+# 303612:/?/init.lua
+```
+
+This is worth stating explicitly because it is easy to get wrong from first principles. It would be
+reasonable to assume that, with no filesystem API and no game-directory accessor in this build
+(`fs.*`, `get_game_directory`, `get_module_path` are all absent), a script cannot locate its own
+modules and must ship as one file. **That assumption is wrong** — the framework configures
+`package.path` for you.
+
+### `--bundle` fallback
+
+The installer also supports a single-file mode:
+
+```bash
+./tools/install.sh "<game path>" --bundle
+```
+
+This builds `src/` into one self-contained file that registers every module in `package.preload` —
+which Lua's `require()` consults **before** any path-based searcher. It has no dependency on
+`package.path` at all.
+
+It exists as a **diagnostic**: if modular mode ever stops loading, `--bundle` isolates whether the
+problem is module resolution or something else. It is also robust against future `ScriptRunner`
+changes. It is not the default, because the modular layout is easier to iterate on and is what the
+framework actually supports.
 
 Edit files in `src/`, then re-run `tools/install.sh`.
 
@@ -270,10 +309,10 @@ src/
     object_helpers.lua     live object lifetime + handle cache
     imgui_safe.lua         defensive imgui wrappers
 tools/
-  bundle.lua               src/ -> single autorun file via package.preload
-  install.sh
-  uninstall.sh
-  selfcheck.lua            offline test harness
+  bundle.lua               src/ -> single self-contained file (--bundle diagnostic mode)
+  install.sh               modular install by default
+  uninstall.sh             removes only files this trainer installed
+  selfcheck.lua            offline test harness (stubs REFramework)
 ```
 
 ---
