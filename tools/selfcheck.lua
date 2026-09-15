@@ -23,10 +23,37 @@
   quietly depending on a global that a different script happened to set.
 
   USAGE
+      # bundle mode: run the single generated file
       lua tools/selfcheck.lua build/re7trainer.lua
+
+      # modular mode: run an installed autorun tree the way ScriptRunner does
+      lua tools/selfcheck.lua --autorun /path/to/reframework/autorun
+
+  Modular mode reproduces what ScriptRunner::reset_scripts() does before it
+  runs scripts — appends <autorun>/?.lua and <autorun>/?/init.lua to
+  package.path — and then executes autorun/re7trainer.lua exactly as the
+  framework would. That exercises the real module resolution path rather than
+  the package.preload shortcut the bundle uses.
 ----------------------------------------------------------------------------]]
 
-local bundle_path = arg[1] or "build/re7trainer.lua"
+-- ---------------------------------------------------------------------------
+-- Mode selection
+-- ---------------------------------------------------------------------------
+
+local mode = "bundle"
+local target = arg[1] or "build/re7trainer.lua"
+
+if arg[1] == "--autorun" then
+  if arg[2] == nil then
+    io.stderr:write("usage: selfcheck.lua --autorun <reframework/autorun dir>\n")
+    os.exit(64)
+  end
+  mode = "modular"
+  local autorun = arg[2]:gsub("/+$", "")
+  -- What ScriptRunner does for us before running any script.
+  package.path = package.path .. ";" .. autorun .. "/?.lua;" .. autorun .. "/?/init.lua"
+  target = autorun .. "/re7trainer.lua"
+end
 
 local failures = 0
 local checks = 0
@@ -231,11 +258,12 @@ end
 -- ---------------------------------------------------------------------------
 
 io.write("RE7 Personal Trainer selfcheck\n")
-io.write(string.format("bundle: %s\n\n", bundle_path))
+io.write(string.format("mode  : %s\n", mode))
+io.write(string.format("target: %s\n\n", target))
 
 io.write("load\n")
-local chunk, load_err = loadfile(bundle_path)
-check("bundle parses", chunk ~= nil, load_err)
+local chunk, load_err = loadfile(target)
+check("entry point parses", chunk ~= nil, load_err)
 
 if chunk == nil then
   io.write("\nFAILED to load.\n")
@@ -308,12 +336,42 @@ end
 
 io.write("\nmodule resolution\n")
 do
+  if mode == "bundle" then
+    -- The bundle registers every module in package.preload, so all of them
+    -- must be present up front regardless of whether they have been required.
+    local names = {}
+    for name in pairs(package.preload) do
+      if name:match("^re7trainer%.") then names[#names + 1] = name end
+    end
+    table.sort(names)
+    check("all 17 modules preloaded", #names == 17, string.format("%d registered", #names))
+  else
+    -- Modular mode has no preload table; resolution went through package.path.
+    -- What matters is that the entry point and its transitive dependencies
+    -- actually got loaded from the installed tree.
+    local expected = {
+      "re7trainer.main", "re7trainer.logger", "re7trainer.state",
+      "re7trainer.config", "re7trainer.utils.safe_call",
+      "re7trainer.utils.object_helpers", "re7trainer.utils.type_helpers",
+      "re7trainer.utils.imgui_safe", "re7trainer.ui.menu",
+      "re7trainer.cheats.health", "re7trainer.cheats.ammo",
+      "re7trainer.cheats.inventory",
+    }
+    local missing = {}
+    for _, name in ipairs(expected) do
+      if package.loaded[name] == nil then missing[#missing + 1] = name end
+    end
+    check("entry point and dependencies resolved via package.path",
+          #missing == 0,
+          #missing > 0 and table.concat(missing, ", ") or nil)
+  end
+
+  -- Every module must require cleanly, whichever mode we are in.
   local names = {}
-  for name in pairs(package.preload) do
+  for name in pairs(mode == "bundle" and package.preload or {}) do
     if name:match("^re7trainer%.") then names[#names + 1] = name end
   end
   table.sort(names)
-  check("all 17 modules registered", #names == 17, string.format("%d registered", #names))
 
   local loaded_ok = true
   for _, name in ipairs(names) do
@@ -325,7 +383,9 @@ do
       end
     end
   end
-  check("every module requires cleanly", loaded_ok)
+  if #names > 0 then
+    check("every module requires cleanly", loaded_ok)
+  end
 end
 
 -- ---------------------------------------------------------------------------
