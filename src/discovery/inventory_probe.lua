@@ -63,10 +63,27 @@ M.TARGETS = {
   "app.InventorySystem",
   "app.ItemManager",
 
-  -- Containers and entries.
+  -- The container and slot model. This is where a quantity most plausibly
+  -- lives: a slot holding an item ID and a count.
+  "app.Inventory",
+  "app.Inventory.ItemInfo",
+  "app.InventoryItemInfo",
+  "app.ItemSlotData",
+  "app.ItemSlotManager",
+
+  -- The item itself.
+  "app.Item",
+  "app.ItemData",
+  "app.ItemID",
+  "app.ItemSettings",
+  "app.ItemSettingsContainer",
+
+  -- Storage chest.
   "app.ItemBoxData",
   "app.InventoryItemBox",
   "app.InventoryItemBox.ItemNumType",
+
+  -- Add / consume operations.
   "app.AddItem",
   "app.AddItemListData",
 
@@ -79,10 +96,17 @@ M.TARGETS = {
 --- classification. If one of these exposes a usable category, the trainer can
 --- honour "never touch key items"; if none does, that limitation gets
 --- documented rather than worked around.
+---
+--- app.Item.ItemCategoryType is the leading candidate: it is a category enum
+--- declared directly on the item type, which is the natural place for exactly
+--- this distinction. This is the single most important thing to resolve before
+--- Infinite Items can ever be enabled.
 M.CLASSIFICATION_TARGETS = {
+  "app.Item.ItemCategoryType",
+  "app.Item.ITEMSTATE",
+  "app.Item.ItemSlotSize",
   "app.PlayerWeaponChange.ItemType",
   "app.InventoryItemBox.ItemNumType",
-  "app.ItemBoxData",
 }
 
 --- Run the probe.

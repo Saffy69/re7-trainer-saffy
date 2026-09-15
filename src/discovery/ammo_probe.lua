@@ -53,10 +53,19 @@ M.TARGETS = {
   -- attached to this object.
   "app.PlayerGun",
 
+  -- The likely implementation/base behind the player weapon, plus the type
+  -- whose name most directly suggests the ammunition itself. app.Cartridge is
+  -- the strongest candidate for "a round of ammunition" as an object.
+  "app.WeaponGun",
+  "app.WeaponGun.BulletInfo",
+  "app.Cartridge",
+  "app.CartridgeData",
+
   -- Weapon switching / equipping. If the weapon object is swapped rather than
   -- mutated, the swap is where a stale handle would break us.
   "app.PlayerWeaponChange",
   "app.PlayerEquipCheck",
+  "app.EquipManager",
 
   -- Throwables and melee have their own counts; worth knowing whether they
   -- share a base class with firearms.

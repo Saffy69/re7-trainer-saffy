@@ -80,13 +80,24 @@ M.CANDIDATE_TYPES = {
   -- whole database: it implies health is bounded by table-driven maximums,
   -- which would give us a principled ceiling to preserve against rather than
   -- an invented constant.
+  --
+  -- app.fsm.HealthSet and app.HealthInfo came out of a broader sweep and are
+  -- strong additions: RE Engine implements gameplay actions as FSM nodes, and
+  -- a node literally named "HealthSet" is a plausible single place where the
+  -- health value is written — which would make the "preserve" strategy far
+  -- more tractable than watching a raw field.
   health = {
     "app.PlayerMaxHealthTable",
+    "app.HealthInfo",
+    "app.fsm.HealthSet",
+    "app.CharacterCommonStatus",
+    "app.PlayerBase",
     "app.PlayerResurrection",
     "app.PlayerBreathController",
     "app.PlayerBreathController.HealthConditionEnum",
     "app.CharacterDefine",
     "app.CharacterDefine.Vitality",
+    "app.ItemHealthRecover",
     "app.PlayerLArmDamage",
   },
 
@@ -103,21 +114,40 @@ M.CANDIDATE_TYPES = {
     "app.Collision.DamageManager",
     "app.Collision.CalculateDamage",
     "app.Collision.DamageUserData",
+    "app.Collision.HitController",
     "app.Collision.HitController.DamageInfo",
     "app.Collision.HitController.DamageValue",
+    "app.fsm.CH8PlayerDamageCheck",
+    "app.CH8HUDControl.Damage",
   },
 
   -- Weapons and ammunition. app.PlayerGun is the unprefixed main-game gun.
   -- Whether the magazine count lives on the gun or in the inventory is the
   -- central question for infinite ammo.
+  --
+  -- app.WeaponGun / app.WeaponGun.BulletInfo and app.Cartridge* came out of a
+  -- broader sweep. A type literally named "Cartridge" is a strong candidate for
+  -- the ammunition entity, and app.WeaponGun looks like the base or the actual
+  -- implementation behind app.PlayerGun.
   weapon = {
     "app.PlayerGun",
     "app.CH8PlayerGun",
     "app.CH9PlayerGun",
+    "app.WeaponGun",
+    "app.WeaponGun.BulletInfo",
+    "app.WeaponGun.WeaponGunSaveData",
+    "app.WeaponGunParameter",
+    "app.Weapon",
+    "app.WeaponData",
+    "app.WeaponItem",
+    "app.Cartridge",
+    "app.CartridgeData",
+    "app.CartridgeRequester",
     "app.PlayerWeaponChange",
     "app.PlayerWeaponChange.ItemType",
     "app.PlayerReloadSpeedRateTable",
     "app.PlayerEquipCheck",
+    "app.EquipManager",
     "app.PlayerMelee",
     "app.PlayerThrowable",
     "app.BulletBase",
@@ -127,11 +157,32 @@ M.CANDIDATE_TYPES = {
   -- Inventory and items. app.InventoryManager is a CONFIRMED managed
   -- singleton — it appeared as app.SingletonBehavior`1<app.InventoryManager>
   -- in the type dump, which is how the engine declares singleton managers.
+  --
+  -- The two most important additions from the broader sweep:
+  --   app.Item.ItemCategoryType  — a category enum on the item itself. This is
+  --     the leading candidate for distinguishing a stackable consumable from a
+  --     key item, which is a HARD PRECONDITION for Infinite Items.
+  --   app.Inventory / app.ItemSlotData / app.ItemSlotManager — the container
+  --     and slot model, i.e. where a quantity plausibly lives.
   inventory = {
     "app.InventoryManager",
     "app.InventorySystem",
+    "app.Inventory",
+    "app.Inventory.ItemInfo",
+    "app.InventoryItemInfo",
     "app.ItemManager",
     "app.ItemResourceManager",
+    "app.Item",
+    "app.Item.ItemCategoryType",
+    "app.Item.ITEMSTATE",
+    "app.Item.ItemSlotSize",
+    "app.Item.ItemSaveData",
+    "app.ItemID",
+    "app.ItemData",
+    "app.ItemSlotData",
+    "app.ItemSlotManager",
+    "app.ItemSettings",
+    "app.ItemSettingsContainer",
     "app.ItemBoxData",
     "app.InventoryItemBox",
     "app.PlayerItem",

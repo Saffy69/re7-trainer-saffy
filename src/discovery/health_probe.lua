@@ -49,27 +49,38 @@ M.NAME = "health"
 -- so that if a future reader only reads the first few entries they still get
 -- the useful ones.
 M.TARGETS = {
-  -- 1. The player's own damage controller. If it exposes a method that applies
+  -- 1. The FSM node that writes the health value. RE Engine implements
+  --    gameplay actions as FSM nodes, so a node named "HealthSet" is a
+  --    plausible single choke point — and a single choke point is much easier
+  --    to work with than a raw field that many code paths touch.
+  "app.fsm.HealthSet",
+
+  -- 2. The health record itself.
+  "app.HealthInfo",
+  "app.CharacterCommonStatus",
+
+  -- 3. The player's own damage controller. If it exposes a method that applies
   --    or absorbs damage, that is the preferred hook point — it is the narrowest
   --    interception that leaves everything else untouched.
   "app.PlayerDamageController",
 
-  -- 2. The player's health/status container. If a plain readable health value
+  -- 4. The player's health/status container. If a plain readable health value
   --    lives here, the "preserve and restore" approach becomes available as a
   --    fallback when hooking is not viable.
   "app.PlayerStatus",
+  "app.PlayerBase",
 
-  -- 3. The shared damage pipeline. Broader than (1) — hooking here would affect
+  -- 5. The shared damage pipeline. Broader than (3) — hooking here would affect
   --    enemies too — so it is a fallback, not a first choice.
   "app.DamageController",
-
-  -- 4. Collision-level damage. Broader still.
   "app.Collision.DamageManager",
   "app.Collision.CalculateDamage",
+  "app.Collision.HitController",
 
-  -- 5. Supporting types that bound or describe health.
+  -- 6. Supporting types that bound or describe health.
   "app.PlayerMaxHealthTable",
   "app.PlayerResurrection",
+  "app.ItemHealthRecover",
   "app.CharacterDefine",
 }
 
