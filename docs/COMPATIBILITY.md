@@ -147,6 +147,37 @@ begin_child   bullet_text   colored_text
 `colored_text` being absent is why the UI states status in plain text rather than with a coloured
 dot — an indicator depending on a missing binding is worse than no indicator.
 
+### Script loading — verified
+
+How autorun scripts are found and how `require()` resolves was read out of `ScriptRunner.cpp` at
+tag v1.5.9 and corroborated against the installed binary.
+
+| Behaviour | Detail |
+|---|---|
+| Loader scope | `autorun/*.lua`, **non-recursive**. Subdirectories are ignored and their files are never auto-executed. |
+| Load order | raw filesystem iteration order — **not sorted**. Do not depend on ordering between top-level scripts. |
+| `package.path` | `reset_scripts()` appends `<autorun>/?.lua` and `<autorun>/?/init.lua` **before** running scripts |
+| Module name mapping | dots in the `require` string become the platform separator, inserted at `?` |
+| `re.on_script_reset` | fires during reset, after `on_config_save`, before the `lua_State` is destroyed |
+| `re.on_config_save` | receives **no** config object; it is a notification only. There is no Lua-side `on_config_load` in this build. |
+
+Binary corroboration — the `package.path` suffixes sit immediately after the `[ScriptState] Running
+script {}...` string:
+
+```bash
+grep -n 'Running script\|^/?.lua$\|^/?/init.lua$\|^/?.dll$' dll_strings.txt
+# 303609:[ScriptState] Running script {}...
+# 303610:path
+# 303611:/?.lua
+# 303612:/?/init.lua
+# 303613:/?.dll
+```
+
+**Consequence for this project:** the trainer installs a single top-level loader
+(`autorun/re7trainer.lua`) and puts its modules in `autorun/re7trainer/`. The loader is the only
+file auto-executed; the modules are pulled in by `require()`, which the framework's own
+`package.path` setup makes resolve correctly.
+
 ### Known unverified
 
 | Item | Status |
