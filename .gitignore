@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# REFramework runtime artifacts
+#
+# REFramework writes these next to the game executable. They are generated at
+# runtime, contain machine-specific paths, and must never be committed.
+# ---------------------------------------------------------------------------
+re2_framework_log.txt
+re2_fw_config.txt
+ref_ui.ini
+reframework_crash.dmp
+reframework_accessed_files.txt
+reframework_loose_files.txt
+reframework_recent_errors.txt
+shader.cache2
+vkd3d-proton.cache
+
+# The framework binary itself and its plugin DLLs. Never commit these:
+# they are third-party binaries, not ours.
+dinput8.dll
+reframework/plugins/*.dll
+
+# ---------------------------------------------------------------------------
+# Trainer runtime output
+#
+# Written by the discovery subsystem when a dump is requested. These are
+# per-session snapshots of the live game process, not source.
+# ---------------------------------------------------------------------------
+discovery_out/
+*.dump.json
+re7trainer_config.json
+re7trainer.log
+
+# ---------------------------------------------------------------------------
+# Proprietary game files — never commit anything from the game directory.
+# ---------------------------------------------------------------------------
+*.pak
+*.exe
+re_chunk_*
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+build/
