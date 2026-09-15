@@ -143,7 +143,30 @@ end
 
 local cache = {}
 
+--- Reproduce what ScriptRunner does when it resolves a type definition, and
+--- fetch a managed singleton FRESH every time.
+--
+-- Do not route singletons through the cache below. sdk.get_managed_singleton
+-- works by invoking the game's own static get_Instance(), and that can
+-- legitimately return nil mid-session — during a scene transition, a load, or
+-- while the owning system is being torn down and rebuilt. A cached pointer
+-- would survive that and become a dangling reference, which is precisely the
+-- class of bug that turns a trainer into a crash.
+--
+-- TypeDefinitions, by contrast, ARE stable for the process lifetime and are
+-- fine to cache.
+--
+-- @param name string  e.g. "app.InventoryManager"
+-- @return userdata|nil
+function M.singleton_fresh(name)
+  return safe.singleton(name)
+end
+
 --- Fetch a cached handle, or resolve and cache it.
+--
+-- ONLY for objects whose lifetime is bounded by something you can check —
+-- prefer M.acquire for per-frame game objects, and M.singleton_fresh for
+-- singletons. Do not cache singletons with this.
 --
 -- @param key string            stable cache key, e.g. "player_status"
 -- @param resolver function     called as resolver(); returns an object or nil

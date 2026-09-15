@@ -158,6 +158,20 @@ local function draw_developer()
         W.text("Failed: " .. tostring(result))
       end
     end
+
+    -- Separate button on purpose. The first dump reported 0 members for every
+    -- type while name and parent lookups worked, which points at a shape
+    -- mismatch in the member accessors rather than a missing API. This probe
+    -- measures what those accessors actually return.
+    if W.button("Probe reflection API") then
+      local introspect = require("re7trainer.discovery.introspect")
+      local ok, result = introspect.run()
+      if ok then
+        W.text("Wrote " .. tostring(result))
+      else
+        W.text("Failed: " .. tostring(result))
+      end
+    end
   end
 
   if state.runtime.discovery_last ~= nil then

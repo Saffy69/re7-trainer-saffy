@@ -289,7 +289,16 @@ end
 function M.build_payload()
   local payload = {
     schema = "re7trainer-discovery",
-    schema_version = 1,
+    schema_version = 2,
+    -- Carried in the output itself so a reader cannot mistake an empty member
+    -- list for "this type has no members".
+    caveat =
+      "get_methods() is a FILTERED view: it drops methods whose function pointer is null and "
+      .. "methods whose code is still stub. RE Engine JIT-resolves managed methods on first call, "
+      .. "so a method that has never executed does not appear here at all. If most types below "
+      .. "show 0 methods, the dump was taken before the relevant gameplay ran -- take damage, fire "
+      .. "the weapon, and use an item, then dump again. Use type:get_method(name) to look up a "
+      .. "method by name, which is NOT filtered.",
     environment = {
       game_name = state.runtime.game_name,
       sdk_available = state.runtime.sdk_available,

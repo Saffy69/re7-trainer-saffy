@@ -336,43 +336,47 @@ end
 
 io.write("\nmodule resolution\n")
 do
+  -- Modules the entry point cannot work without. Listed explicitly rather than
+  -- asserted as a magic total, so adding a module does not silently break the
+  -- check and removing a required one does not silently pass.
+  local REQUIRED = {
+    "re7trainer.main", "re7trainer.logger", "re7trainer.state",
+    "re7trainer.config", "re7trainer.utils.safe_call",
+    "re7trainer.utils.object_helpers", "re7trainer.utils.type_helpers",
+    "re7trainer.utils.imgui_safe", "re7trainer.ui.menu",
+    "re7trainer.cheats.health", "re7trainer.cheats.ammo",
+    "re7trainer.cheats.inventory", "re7trainer.discovery.explorer",
+    "re7trainer.discovery.introspect",
+  }
+
+  local names = {}
   if mode == "bundle" then
-    -- The bundle registers every module in package.preload, so all of them
-    -- must be present up front regardless of whether they have been required.
-    local names = {}
     for name in pairs(package.preload) do
       if name:match("^re7trainer%.") then names[#names + 1] = name end
     end
     table.sort(names)
-    check("all 17 modules preloaded", #names == 17, string.format("%d registered", #names))
+    check("bundle preloads every module", #names >= #REQUIRED,
+          string.format("%d registered, %d required", #names, #REQUIRED))
   else
     -- Modular mode has no preload table; resolution went through package.path.
-    -- What matters is that the entry point and its transitive dependencies
-    -- actually got loaded from the installed tree.
-    local expected = {
-      "re7trainer.main", "re7trainer.logger", "re7trainer.state",
-      "re7trainer.config", "re7trainer.utils.safe_call",
-      "re7trainer.utils.object_helpers", "re7trainer.utils.type_helpers",
-      "re7trainer.utils.imgui_safe", "re7trainer.ui.menu",
-      "re7trainer.cheats.health", "re7trainer.cheats.ammo",
-      "re7trainer.cheats.inventory",
-    }
+    --
+    -- Note: some modules are lazy-loaded by design (the discovery probes are
+    -- only required when the user presses the button), so "not in
+    -- package.loaded yet" is not a fault. The real question is whether each
+    -- required module RESOLVES through package.path, so require them all here.
     local missing = {}
-    for _, name in ipairs(expected) do
-      if package.loaded[name] == nil then missing[#missing + 1] = name end
+    for _, name in ipairs(REQUIRED) do
+      local r_ok = pcall(require, name)
+      if not r_ok then
+        missing[#missing + 1] = name
+      end
     end
-    check("entry point and dependencies resolved via package.path",
+    check("every module resolves via package.path",
           #missing == 0,
           #missing > 0 and table.concat(missing, ", ") or nil)
   end
 
-  -- Every module must require cleanly, whichever mode we are in.
-  local names = {}
-  for name in pairs(mode == "bundle" and package.preload or {}) do
-    if name:match("^re7trainer%.") then names[#names + 1] = name end
-  end
-  table.sort(names)
-
+  -- Every module that is registered must require cleanly, whichever mode.
   local loaded_ok = true
   for _, name in ipairs(names) do
     if package.loaded[name] == nil then
@@ -384,8 +388,19 @@ do
     end
   end
   if #names > 0 then
-    check("every module requires cleanly", loaded_ok)
+    check("every registered module requires cleanly", loaded_ok)
   end
+
+  -- And every required module must be genuinely loadable right now.
+  local req_ok = true
+  for _, name in ipairs(REQUIRED) do
+    local r_ok, r_err = pcall(require, name)
+    if not r_ok then
+      req_ok = false
+      io.write(string.format("     required %s -> %s\n", name, tostring(r_err)))
+    end
+  end
+  check("all required modules load", req_ok)
 end
 
 -- ---------------------------------------------------------------------------

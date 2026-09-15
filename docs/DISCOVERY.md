@@ -154,24 +154,83 @@ app.PlayerThrowable                  app.BulletBase / app.BulletID
 
 ## Running the discovery dump
 
+> ### Do this AFTER exercising the systems, not before
+>
+> This is the single most important thing to understand about the dump, and it
+> is not obvious.
+>
+> `RETypeDefinition:get_methods()` is a **filtered** view. It is a custom
+> binding (Sdk.cpp:1513-1533 at tag v1.5.9) that deliberately drops:
+>
+> - every method whose `get_function()` is **null**
+> - every method whose code is still **stub code**
+>
+> RE Engine resolves managed methods lazily — the native body is produced on
+> first call. A method that has never been invoked has a null function pointer,
+> so **it does not appear in the list at all.**
+>
+> The consequence is stark: a dump taken from a freshly loaded save reports
+> **zero methods for every type**, which is exactly what happened on the first
+> run of this tool:
+>
+> ```
+> app.PlayerDamageController  (0m/0f)
+>   parents = app.DamageController, app.DoomsUpdater, app.DoomsBehavior,
+>             via.Behavior, via.Component, System.Object
+> ```
+>
+> The inheritance chain resolved perfectly — `get_parent_type()` works
+> unconditionally — but no methods had been JIT-resolved yet because nothing had
+> been shot, hit, or picked up.
+>
+> **So the procedure is: play first, dump second.**
+>
+> 1. Load into gameplay.
+> 2. **Take damage** — let a Molded hit you once or twice.
+> 3. **Fire a weapon** — empty a magazine, and reload.
+> 4. **Use an item** — consume a herb or a chem fluid.
+> 5. Open the menu and run the dump.
+>
+> Do that and the health, ammo and inventory types should each come back with
+> populated method lists. If a specific subsystem is still empty afterwards,
+> that itself is information: it means the code path never ran, and the type
+> you are looking at is not the one the game is actually using.
+
 You need this because of the gap above: the dump is the only way to learn member names.
 
 1. Launch RE7 and **load into actual gameplay.** Game objects are not constructed in the main
    menu; running the dump there produces an empty result.
-2. Press **Insert** to open the REFramework menu.
-3. Open **RE7 Personal Trainer → Developer**.
-4. Click **Run discovery dump**.
-5. The trainer writes `re7trainer_discovery.json` into the game folder, next to `re7.exe`:
+2. **Exercise the systems you care about** (see the box above) — this is what makes the method
+   lists non-empty.
+3. Press **Insert** to open the REFramework menu.
+4. Open **RE7 Personal Trainer → Developer**.
+5. Click **Run discovery dump**.
+6. The trainer writes `re7trainer_discovery.json` to:
 
    ```
-   ~/.local/share/Steam/steamapps/common/RESIDENT EVIL 7 biohazard/re7trainer_discovery.json
+   <game>/reframework/data/re7trainer_discovery.json
    ```
 
-6. Optionally also tick **Log discovery output** to mirror a summary into the REFramework log.
+   Note the path: `json.dump_file` resolves **relative to `reframework/data/`**, not the game root.
+   This was determined empirically from a real run — the file did not appear where the trainer's
+   own documentation had assumed.
+
+7. Optionally also tick **Log discovery output** to mirror a summary into the REFramework log.
 
 **The JSON file is written through `json.dump_file`, which does not depend on REFramework's "Log to
 disk" setting.** That setting is currently `false` in `re2_fw_config.txt`, which is why the
 trainer writes its own file rather than relying on the log.
+
+### If a type still comes back empty
+
+Use **Developer → Probe reflection API**. That runs a separate capability probe which reports,
+for a handful of representative types, what each reflection accessor *actually returns* — the Lua
+type of the result, whether it is array-like, whether it is zero-indexed, and what the element
+objects look like.
+
+It exists because of a real failure: the first dump returned zero members for every type, and
+"genuinely empty" is indistinguishable from "returned a shape we do not understand" unless you
+measure. The probe measures.
 
 ### Send back
 

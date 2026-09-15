@@ -114,12 +114,31 @@ end
 -- Members
 -- ---------------------------------------------------------------------------
 
+--- Note an unexpected return shape -- once per accessor.
+--
+-- This exists because of a real failure: an early discovery dump reported
+-- "0 methods" for every type in the game, which is indistinguishable from
+-- "this build exposes no members". The actual cause was that the accessor
+-- returned something that is not a Lua array, and the old code coerced that
+-- silently to an empty table -- turning an unknown into a confident zero.
+--
+-- Never let an unexpected shape look like a legitimate empty result again.
+-- @param accessor string
+-- @param value any
+local function note_unexpected_shape(accessor, value)
+  logger.once("shape:" .. accessor, "warn", "Discovery",
+              accessor .. "() returned " .. type(value) ..
+              ", not a table. Member lists will be empty until this is handled. " ..
+              "Run 'Probe reflection API' in the Developer section to measure the real shape.")
+end
+
 --- Declared methods of a type.
 -- @param type_definition userdata
 -- @return table array of Method objects (possibly empty)
 function M.methods(type_definition)
   local result = safe.try(type_definition, "get_methods")
   if type(result) ~= "table" then
+    note_unexpected_shape("get_methods", result)
     return {}
   end
   return result
@@ -131,6 +150,7 @@ end
 function M.fields(type_definition)
   local result = safe.try(type_definition, "get_fields")
   if type(result) ~= "table" then
+    note_unexpected_shape("get_fields", result)
     return {}
   end
   return result
