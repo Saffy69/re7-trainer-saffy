@@ -178,6 +178,93 @@ grep -n 'Running script\|^/?.lua$\|^/?/init.lua$\|^/?.dll$' dll_strings.txt
 file auto-executed; the modules are pulled in by `require()`, which the framework's own
 `package.path` setup makes resolve correctly.
 
+### Object model — corrections that matter
+
+The REManagedObject usertype does **not** expose the accessors it is commonly assumed to have. Verified
+against the registration block in the installed binary (the sol2 names run contiguously at
+`dll_strings.txt` lines 304706–304830, matching `src/mods/bindings/Sdk.cpp` at tag v1.5.9 line for line):
+
+| Assumed | Reality |
+|---|---|
+| `obj:get_type()` | **does not exist** — use `obj:get_type_definition()` |
+| `obj:get_method()` | **does not exist** — use `obj:call(name, ...)` or `obj:get_type_definition():get_method(name)` |
+| `obj:get_name()` / `obj:get_full_name()` | **do not exist** — use `obj:get_type_definition():get_name()` |
+| `obj:is_a("...")` | **does not exist on the object** — use `obj:get_type_definition():is_a(...)` |
+
+`REManagedObject` in this build exposes: `get_type_definition`, `get_field`, `set_field`, `call`,
+`get_address`, `get_object_size`, `get_reference_count`, `add_ref`, `release`, the raw `read_*`/`write_*`
+pairs, and the `__index`/`__new_index` metamethods.
+
+`RETypeDefinition:get_declaring_type` **does not exist** — that binding belongs to `REMethodDefinition`
+and `REField`.
+
+### Numeric conversion — only four helpers exist
+
+```
+sdk.to_int64   sdk.to_float   sdk.to_double   sdk.to_ptr
+```
+
+`to_sbyte`, `to_byte`, `to_int16`, `to_uint16`, `to_int32`, `to_uint32` **do not exist**. For a narrower
+integer, mask the `to_int64` result.
+
+### `get_methods()` is a FILTERED view — and this shapes the whole discovery procedure
+
+`RETypeDefinition:get_methods()` is a custom binding that deliberately drops every method whose
+`get_function()` is null, and every method whose code is still stub code.
+
+RE Engine resolves managed methods lazily, on first call. **A method that has never been executed has a
+null function pointer and therefore does not appear in the list at all.**
+
+This is not a footnote. It means a dump taken from a freshly loaded save reports **zero methods for every
+type**, while `get_parent_type()` still returns correct inheritance chains. That is exactly what the first
+dump on this machine produced. The dump must be taken **after** the relevant gameplay has run — see
+[DISCOVERY.md](DISCOVERY.md#running-the-discovery-dump).
+
+Note the asymmetry: `get_method(name)` does **no** filtering and will return a descriptor for a method
+`get_methods()` omits. So "it is not in the list" does not mean "it does not exist" — only that the engine
+has not resolved it yet.
+
+### `sdk.hook` — exact signature, from source
+
+```lua
+sdk.hook(method_definition, pre_callback, post_callback, ignore_jmp)
+```
+
+- **pre** receives **one** argument: a 1-indexed table of raw `void*` values.
+  `args[1]` = `REThreadContext*`, `args[2]` = the `this` pointer, `args[3..]` = the parameters.
+  **Mutating the table writes back to the real arguments.**
+- Return `sdk.PreHookResult.SKIP_ORIGINAL` from pre to skip the original method.
+- **post** receives one positional argument, `(void*)ret_val`. **Its return value replaces the original
+  return value.**
+- Any callback may be `nil`.
+
+**Threading:** hooks run **synchronously on whatever game thread invoked the hooked method**, not on a
+dedicated thread, and not on the main Lua thread. Access to the shared Lua state is serialized by a lock,
+so callbacks never interleave — but each one **blocks the calling game thread**, meaning a slow hook
+directly stalls the game. Keep hook bodies short; accumulate state and act in `re.on_frame`.
+
+Hooks are silently bypassed during online play. Recursive hooks are warned about but not prevented.
+
+### `sdk.get_managed_singleton` must be called fresh each time
+
+It works by invoking the game's own static `get_Instance()`, which can legitimately return `nil`
+mid-session — during a scene transition, a load, or while the owning system is rebuilt. **Never cache a
+singleton pointer across frames.** `RETypeDefinition` objects, by contrast, are stable for the process
+lifetime and are fine to cache.
+
+### Master-only APIs — absent from this build
+
+`refdocs.praydog.com` documents a newer REFramework than the one installed. All of these return `0` under
+`grep -acx` against this binary and are **not present in v1.5.9**:
+
+```
+sdk.create_instance_global      sdk.create_userdata_global
+RETypeDefinition:create_instance_gc_safe
+```
+
+The website also correctly confirms there is no `get_property`/`get_properties`/`get_derived_types`/
+`get_attributes` API — property access goes through fields.
+
 ### Known unverified
 
 | Item | Status |
