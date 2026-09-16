@@ -116,11 +116,12 @@ end
 
 --- Note an unexpected return shape -- once per accessor.
 --
--- This exists because of a real failure: an early discovery dump reported
+-- This exists because of a real failure, twice over. An early dump reported
 -- "0 methods" for every type in the game, which is indistinguishable from
--- "this build exposes no members". The actual cause was that the accessor
--- returned something that is not a Lua array, and the old code coerced that
--- silently to an empty table -- turning an unknown into a confident zero.
+-- "this build exposes no members". The cause was that these accessors return
+-- std::vector<T*>, which sol2 converts to a CONTAINER USERDATA rather than a
+-- plain Lua table -- and the old code coerced anything that was not a table to
+-- an empty table. An unknown silently became a confident zero.
 --
 -- Never let an unexpected shape look like a legitimate empty result again.
 -- @param accessor string
@@ -128,20 +129,198 @@ end
 local function note_unexpected_shape(accessor, value)
   logger.once("shape:" .. accessor, "warn", "Discovery",
               accessor .. "() returned " .. type(value) ..
-              ", not a table. Member lists will be empty until this is handled. " ..
-              "Run 'Probe reflection API' in the Developer section to measure the real shape.")
+              ", which no conversion strategy handled. " ..
+              "Run 'Probe reflection API' in the Developer section to see the real shape.")
 end
+
+--- Describe the raw shape of an accessor result, for the dump payload.
+--
+-- Recorded alongside the data so the JSON is self-diagnosing: if the member
+-- lists are empty, the payload says why in terms that do not require a second
+-- round trip to work out.
+-- @param value any
+-- @return table
+local function describe_shape(value)
+  local kind = type(value)
+  local info = { lua_type = kind }
+
+  if kind == "table" then
+    local n = 0
+    for _ in pairs(value) do n = n + 1 end
+    info.pairs_count = n
+    info.ipairs_length = #value
+  elseif kind == "userdata" then
+    -- sol2 container: try the usual accessors without assuming any work.
+    local ok_len, len = pcall(function() return #value end)
+    if ok_len then info.length_op = tostring(len) end
+
+    for _, probe in ipairs({ "size", "get_size", "get_count", "empty" }) do
+      local ok, res = pcall(function() return value[probe](value) end)
+      if ok then info[probe] = tostring(res) end
+    end
+  end
+
+  return info
+end
+
+--- Convert whatever an accessor returned into a plain Lua array.
+--
+-- The accessors return std::vector<T*>, which sol2 exposes as a CONTAINER
+-- USERDATA in this build -- not a Lua table. Rather than assume one shape and
+-- silently produce an empty list when the assumption is wrong, this tries
+-- every strategy that could apply and returns the first that yields elements.
+--
+-- The strategies are tried uniformly regardless of whether the value reports
+-- itself as a table or userdata, because a container that happens to surface
+-- as a table can still be non-array-shaped (0-indexed, or keyed by something
+-- other than 1..n), and ipairs() would silently yield nothing for it. That
+-- exact asymmetry is what produced a confident "0 methods" on every type.
+--
+-- Strategies, in order:
+--   1. ipairs()               -- already a normal Lua array
+--   2. get_size()/size()/get_count(), then 1-based indexing
+--   3. # operator, then 1-based indexing
+--   4. pairs()                -- catches 0-indexed and map-shaped containers
+--
+-- @param value any
+-- @param out table optional table to append into
+-- @return table array
+local function to_array(value, out)
+  out = out or {}
+
+  if value == nil then
+    return out
+  end
+
+  local kind = type(value)
+  if kind ~= "table" and kind ~= "userdata" then
+    return out
+  end
+
+  --- Read `count` consecutive elements starting at `first_index`.
+  ---
+  --- Returns true only if EVERY expected element was present. A partial read is
+  --- rolled back and reported as failure, because a partial read is exactly how
+  --- a wrong indexing convention produces a plausible-looking short list rather
+  --- than an obvious error.
+  local function try_range(first_index, count)
+    local start = #out
+    local got = 0
+
+    for i = first_index, first_index + count - 1 do
+      local ok_i, item = pcall(function() return value[i] end)
+      if not ok_i or item == nil then
+        break
+      end
+      out[#out + 1] = item
+      got = got + 1
+    end
+
+    if got == count then
+      return true
+    end
+
+    for _ = 1, got do
+      out[#out] = nil
+    end
+    return false
+  end
+
+  --- Discover how many elements the container claims to hold, if it will say.
+  ---
+  --- This is deliberately queried BEFORE any iteration. ipairs() stops at the
+  --- first missing index, so a container with a gap -- or one using a different
+  --- indexing base -- yields a short list that looks exactly like a complete
+  --- one. Taking the declared count as authoritative is what makes that
+  --- distinguishable from a genuinely short container.
+  ---
+  --- @return number|nil
+  local function declared_count()
+    for _, sizer in ipairs({ "get_size", "size", "get_count" }) do
+      local ok, method = pcall(function() return value[sizer] end)
+      if ok and type(method) == "function" then
+        local ok_call, count = pcall(method, value)
+        count = tonumber(count)
+        if ok_call and count ~= nil and count > 0 then
+          return count
+        end
+      end
+    end
+
+    local ok_len, length = pcall(function() return #value end)
+    length = tonumber(length)
+    if ok_len and length ~= nil and length > 0 then
+      return length
+    end
+
+    return nil
+  end
+
+  local expected = declared_count()
+
+  -- Strategy 1: the container told us how many it holds. Trust that over any
+  -- iteration, and try both indexing conventions.
+  if expected ~= nil then
+    if try_range(1, expected) or try_range(0, expected) then
+      return out
+    end
+  end
+
+  -- Strategy 2: no declared count. ipairs on a genuine Lua array.
+  if kind == "table" then
+    for _, item in ipairs(value) do
+      out[#out + 1] = item
+    end
+    if #out > 0 then
+      return out
+    end
+  end
+
+  -- Strategy 3: generic iteration. Catches map-shaped containers and anything
+  -- whose keys are not a contiguous range. Capped so a container that iterates
+  -- forever cannot hang the game.
+  local ok_pairs, iter, state, control = pcall(function() return pairs(value) end)
+  if ok_pairs and type(iter) == "function" then
+    local seen = 0
+    local ok_iter = pcall(function()
+      for _, item in iter, state, control do
+        seen = seen + 1
+        if seen > 8192 then
+          break
+        end
+        out[#out + 1] = item
+      end
+    end)
+    if ok_iter and #out > 0 then
+      return out
+    end
+  end
+
+  return out
+end
+
+--- Declared methods of a type.
+-- @param type_definition userdata
+-- @return table array of Method objects (possibly empty)
+--- Convert a raw accessor result into a plain Lua array.
+--
+-- Exposed for testing: this is the single point where the sol2 container
+-- shape is handled, so the selfcheck exercises it directly rather than
+-- relying on the game being present.
+M.to_array = to_array
 
 --- Declared methods of a type.
 -- @param type_definition userdata
 -- @return table array of Method objects (possibly empty)
 function M.methods(type_definition)
   local result = safe.try(type_definition, "get_methods")
-  if type(result) ~= "table" then
+  local list = to_array(result)
+  if #list == 0 and result ~= nil and type(result) ~= "table" then
+    -- Non-empty raw value we could not convert: a real problem, distinct from
+    -- "the engine reports no methods".
     note_unexpected_shape("get_methods", result)
-    return {}
   end
-  return result
+  return list
 end
 
 --- Declared fields of a type.
@@ -149,11 +328,11 @@ end
 -- @return table array of Field objects (possibly empty)
 function M.fields(type_definition)
   local result = safe.try(type_definition, "get_fields")
-  if type(result) ~= "table" then
+  local list = to_array(result)
+  if #list == 0 and result ~= nil and type(result) ~= "table" then
     note_unexpected_shape("get_fields", result)
-    return {}
   end
-  return result
+  return list
 end
 
 --- Method names only.
@@ -266,14 +445,17 @@ function M.dump_type(name)
     }
   end
 
+  local raw_methods = safe.try(type_definition, "get_methods")
+  local raw_fields = safe.try(type_definition, "get_fields")
+
   local methods = {}
-  for _, method in ipairs(M.methods(type_definition)) do
+  for _, method in ipairs(to_array(raw_methods)) do
     methods[#methods + 1] = M.describe_method(method)
   end
   table.sort(methods)
 
   local fields = {}
-  for _, field in ipairs(M.fields(type_definition)) do
+  for _, field in ipairs(to_array(raw_fields)) do
     fields[#fields + 1] = M.describe_field(field)
   end
   table.sort(fields)
@@ -292,6 +474,13 @@ function M.dump_type(name)
     field_count = #fields,
     methods = methods,
     fields = fields,
+    -- Raw return shapes. If the counts above are zero while these say the
+    -- accessor returned something non-nil, the problem is our conversion, not
+    -- the game -- and this records exactly which shape we received.
+    raw_shapes = {
+      get_methods = describe_shape(raw_methods),
+      get_fields = describe_shape(raw_fields),
+    },
   }
 end
 
