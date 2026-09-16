@@ -36,6 +36,7 @@
 
 local logger = require("re7trainer.logger")
 local state = require("re7trainer.state")
+local safe = require("re7trainer.utils.safe_call")
 local game = require("re7trainer.game")
 
 local M = {}
@@ -60,13 +61,16 @@ function M.initialize()
   baseline = nil
   restores = 0
 
-  if game.gun_ammo() == nil then
-    state.mark_unsupported("ammo", "no equipped weapon, or its magazine is not readable")
-    logger.warn("Ammo", "Cannot read a magazine count; Infinite Ammo will stay disabled.")
+  -- TYPE-LEVEL CHECK ONLY. See the note in cheats/health.lua: initialize() runs
+  -- at script load, which is the main menu, where there is no equipped weapon.
+  -- Requiring one here marked the subsystem unsupported for the whole session.
+  if safe.type_definition("app.WeaponGun") == nil then
+    state.mark_unsupported("ammo", "app.WeaponGun is not present in this build")
+    logger.warn("Ammo", "Target type missing; Infinite Ammo will stay disabled.")
     return
   end
 
-  state.mark_supported("ammo", "magazine is both readable and writable")
+  state.mark_supported("ammo", "magazine is readable and writable (checked at enable time)")
   logger.info("Ammo", "Ready. Restoring the magazine count when it decreases.")
 end
 
@@ -83,6 +87,9 @@ function M.status()
   if not enabled then
     return "ready (off)"
   end
+  if state.runtime.ammo_current == nil then
+    return "enabled, waiting for a weapon"
+  end
   return "active (" .. tostring(restores) .. " restored)"
 end
 
@@ -94,9 +101,18 @@ function M.enable()
     return false, reason
   end
 
+  -- Live check at the moment of asking.
   local ammo = game.gun_ammo()
-  baseline = ammo and ammo.magazine or nil
+  if ammo == nil then
+    local reason = "no weapon equipped or readable -- draw a weapon and try again"
+    state.runtime.ammo_reason = reason
+    logger.warn("Ammo", "Cannot enable: " .. reason)
+    return false, reason
+  end
+
+  baseline = ammo.magazine
   enabled = true
+  state.runtime.ammo_reason = "magazine is readable and writable"
 
   if baseline == 0 then
     logger.warn("Ammo", "Enabled while the magazine is empty, so there is nothing to preserve. "
@@ -125,6 +141,10 @@ function M.update()
     -- Weapon swapped, holstered, or a scene change. Drop the baseline rather
     -- than carrying a count from a different gun onto this one.
     baseline = nil
+    state.runtime.ammo_current = nil
+    if enabled then
+      state.runtime.ammo_reason = "waiting for a weapon (none equipped, or a menu is open)"
+    end
     return
   end
 

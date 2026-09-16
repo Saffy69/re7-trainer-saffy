@@ -290,6 +290,58 @@ local function draw_hook_probe()
   end
 end
 
+--- Draw what the item classification gate actually sees.
+--
+-- This exists because the category read failed in game in a way that could not
+-- be diagnosed from the log line alone: the hook reported "category unreadable"
+-- with no indication of whether the item, the ItemData, or the enum read was
+-- the part that failed. Each item is listed with the raw observation so the
+-- exact failing step is visible.
+local function draw_item_classification()
+  local game = require("re7trainer.game")
+
+  W.spacing()
+  W.text("Item classification")
+  W.muted("the gate that decides what may be conserved")
+
+  local infos = game.item_infos()
+  if #infos == 0 then
+    W.text("  no items readable (main menu, or inventory not reachable)")
+    return
+  end
+
+  local shown = 0
+  for _, info in ipairs(infos) do
+    if shown >= 8 then
+      W.muted(string.format("... and %d more", #infos - shown))
+      break
+    end
+
+    local item = require("re7trainer.utils.object_helpers").get(info, "Item")
+    if item ~= nil then
+      shown = shown + 1
+
+      local id = require("re7trainer.utils.object_helpers").get(item, "ItemDataID")
+      local category, observation = game.item_category(item)
+      local safe_to_conserve, reason = game.is_safe_to_conserve(item)
+      local stack = game.item_stack(item)
+
+      W.text(string.format("  %s  stack=%s",
+              tostring(id or "?"),
+              stack and string.format("%.0f", stack) or "?"))
+
+      W.text(string.format("      category=%s  (%s)",
+              category or "UNREADABLE", tostring(observation)))
+
+      if safe_to_conserve then
+        W.text("      -> conservable: " .. tostring(reason))
+      else
+        W.text("      -> NOT conservable: " .. tostring(reason))
+      end
+    end
+  end
+end
+
 --- Draw the whole debug panel.
 function M.draw()
   if not W.available() then
@@ -300,6 +352,7 @@ function M.draw()
   draw_discovery_state()
   draw_live_values()
   draw_game_access()
+  draw_item_classification()
   draw_hooks()
   draw_hook_probe()
   draw_candidates()
