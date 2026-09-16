@@ -1,169 +1,199 @@
 --[[--------------------------------------------------------------------------
   re7trainer.cheats.health — Infinite Health / God Mode.
 
-  READ THIS BEFORE ASSUMING IT DOES ANYTHING
-  ------------------------------------------
-  This module is structurally complete and functionally EMPTY. That is the
-  correct state for it.
+  THE API THIS USES IS REAL AND WAS READ OUT OF THE RUNNING GAME
+  --------------------------------------------------------------
+  From a live discovery dump (docs/DISCOVERY_RESULTS.md):
 
-  We know RE7's health-related TYPE names (app.PlayerStatus,
-  app.PlayerDamageController, app.PlayerMaxHealthTable, ...) because they were
-  extracted from the user's own REFramework log. We do NOT know a single method
-  or field on any of them. The type dump contains type names only.
+      app.PlayerDamageController
+        M System.Void doDamage(? (1 params))
 
-  Which means any implementation written today would be invented. It would
-  compile, it would run, and it would either do nothing or — worse — write to
-  an offset that happens to be valid and corrupt the save.
+  `doDamage` takes exactly one parameter, which means a hook that suppresses it
+  needs no parameter handling at all — returning SKIP_ORIGINAL is sufficient.
 
-  So enable() refuses, and is_supported() returns false until the discovery
-  subsystem has produced real member data. The UI renders that as a disabled
-  toggle with a reason, which is honest. A toggle that silently does nothing is
-  not.
+  STRATEGY (the project's preferred one, in its stated order)
+  -----------------------------------------------------------
+  Prevent damage at the source rather than rewriting a value afterwards:
 
-  THE STRATEGY THIS MODULE IS BUILT TO IMPLEMENT, once discovery lands
-  -------------------------------------------------------------------
-  In preference order, from least invasive to most:
+      sdk.hook(doDamage, pre = SKIP_ORIGINAL when enabled, post = nil)
 
-    1. HOOK THE DAMAGE PATH. If app.PlayerDamageController exposes a method that
-       applies incoming damage to the player, hooking it and skipping the
-       original call prevents damage at its source. Nothing else in the game is
-       affected: enemies still take damage normally, healing still works, the
-       damage UI simply never fires. This is the preferred approach.
+  Nothing else in the game is affected. Enemies still take damage, healing still
+  works, the damage-animation path is simply never entered. Because the health
+  value is never written by us, there is no window in which a wrong value is
+  visible, and there is no risk of clobbering a legitimate healing event.
 
-    2. PRESERVE THE VALUE. If no suitable hook point exists but a plain health
-       field is readable and writable, capture it while at full health and
-       restore it whenever it drops. Slightly noisier — the damage UI and audio
-       still play — but it never touches code, only data.
+  THE HOOK IS PERMANENT. THE FLAG IS NOT.
+  ---------------------------------------
+  This build has no unhook and no remove_hook (both confirmed absent from the
+  installed binary). Once installed the hook stays for the life of the process.
+  So disabling this cheat does NOT remove the hook — it flips `enabled`, which
+  the callback reads before deciding whether to skip. The callback therefore
+  has to be correct while disabled, which is why it checks the flag first and
+  returns immediately.
 
-    3. RESTORE AFTER THE FACT. If the field is readable but not writable, watch
-       it and restore on the next frame. Highest latency, highest chance of a
-       visible flicker, last resort.
-
-  Which of these is available is decided entirely by what the discovery dump
-  reports. All three are wired into update() as separate, clearly-marked paths
-  so that implementing the real one is a matter of filling in a known shape.
+  A SECOND, SOFTER OPTION EXISTS
+  ------------------------------
+  app.CharacterCommonStatus (inherited by app.PlayerStatus) exposes a writable
+  `set_isForbidDamageReaction(System.Boolean)`. It is not used by default
+  because it is NOT PROVEN to prevent health loss — the name suggests it may
+  govern only the reaction animation while the health value still drops. It is
+  exposed here as an explicit experiment rather than being silently relied on.
 ----------------------------------------------------------------------------]]
 
 local logger = require("re7trainer.logger")
 local state = require("re7trainer.state")
+local safe = require("re7trainer.utils.safe_call")
+local game = require("re7trainer.game")
 
 local M = {}
 
 M.NAME = "health"
 M.LABEL = "Infinite Health / God Mode"
 
---- Which approach is in use: nil until discovery chooses one.
--- One of "hook" | "preserve" | "restore", or nil.
-local strategy = nil
+--- Read by the hook on every call. This, not the hook's existence, is what
+--- enable/disable actually controls.
+local enabled = false
 
---- Cached, validated value captured when the cheat was enabled.
--- For the "preserve" strategy this is the health level we hold the player at.
-local baseline = nil
+--- Whether the hook has been installed at least once.
+local hook_ready = false
 
---- Handle to whatever we hooked, so disable() can undo it cleanly.
-local hook_handle = nil
+--- Optional secondary flag, off unless the user asks for the experiment.
+local use_damage_reaction_flag = false
+
+local HOOK_KEY = "app.PlayerDamageController.doDamage"
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
---- Called once at startup. Never touches the game.
 function M.initialize()
-  strategy = nil
-  baseline = nil
-  hook_handle = nil
-  logger.info("Health", "Module initialised. Awaiting discovery — no health API is known yet.")
-end
+  enabled = false
+  use_damage_reaction_flag = false
 
---- Can this cheat actually do anything right now?
---
--- Returns false until the discovery subsystem has identified a real, verified
--- intervention point AND marked the health subsystem supported.
--- @return boolean
-function M.is_supported()
-  return state.runtime.health_supported == true and strategy ~= nil
-end
-
---- Human-readable reason the cheat is in its current state.
--- @return string
-function M.status()
-  if M.is_supported() then
-    return "active via '" .. tostring(strategy) .. "' strategy"
+  -- Confirm the target exists, but do not hook yet. Hooking is deferred to the
+  -- first enable() so that a player who never turns the cheat on never pays
+  -- any hook cost at all.
+  if safe.type_definition("app.PlayerDamageController") == nil then
+    state.mark_unsupported("health",
+      "app.PlayerDamageController is not present in this build")
+    logger.warn("Health", "Target type missing; Infinite Health will stay disabled.")
+    return
   end
-  return state.runtime.health_reason or "not yet discovered"
+
+  state.mark_supported("health", "app.PlayerDamageController.doDamage discovered")
+  logger.info("Health", "Ready. Hook target: app.PlayerDamageController.doDamage")
 end
 
---- Turn the cheat on.
---
--- Returns false and explains itself when the game API has not been discovered.
--- It never enables a half-implemented path.
--- @return boolean ok, string message
+--- @return boolean
+function M.is_supported()
+  return state.runtime.health_supported == true
+end
+
+--- @return string
+function M.status()
+  if not M.is_supported() then
+    return state.runtime.health_reason or "not available"
+  end
+  if not enabled then
+    return "ready (off)"
+  end
+  return hook_ready and "active (damage suppressed at source)" or "enabling..."
+end
+
+--- Install the hook if it is not already installed.
+-- Safe to call repeatedly: safe_call.hook_method installs at most once per key.
+-- @return boolean ok, string|nil detail
+local function ensure_hook()
+  if hook_ready then
+    return true, nil
+  end
+
+  local ok, detail = safe.hook_method(
+    HOOK_KEY,
+    "app.PlayerDamageController",
+    "doDamage",
+    function(args)
+      -- Runs on the game thread while holding the Lua lock. Keep it minimal.
+      if not enabled then
+        return sdk.PreHookResult.CALL_ORIGINAL
+      end
+      if state.prefs.trainer_enabled ~= true then
+        return sdk.PreHookResult.CALL_ORIGINAL
+      end
+      return sdk.PreHookResult.SKIP_ORIGINAL
+    end,
+    nil
+  )
+
+  if ok then
+    hook_ready = true
+  end
+  return ok, detail
+end
+
+--- @return boolean ok, string message
 function M.enable()
   if not M.is_supported() then
-    local reason = state.runtime.health_reason or "not yet discovered"
-    logger.warn("Health", "Refusing to enable Infinite Health: " .. reason)
+    local reason = state.runtime.health_reason or "not available"
+    logger.warn("Health", "Refusing to enable: " .. reason)
     return false, reason
   end
 
-  -- Reached only once discovery has set a strategy. Each branch is a distinct,
-  -- reviewable implementation — deliberately not collapsed into one clever
-  -- function, because they have different failure modes.
-  if strategy == "hook" then
-    -- TODO(discovery): replace with a sdk.hook on the verified damage method.
-    -- The pre-callback must return sdk.PreHookResult.SKIP_ORIGINAL to prevent
-    -- the damage from being applied; the exact enum name must be read off the
-    -- discovery dump before this is written.
-    logger.warn("Health", "Hook strategy selected but no verified method to hook. This is a bug.")
-    return false, "hook strategy has no verified target"
-
-  elseif strategy == "preserve" then
-    -- TODO(discovery): capture the current value of the verified health field.
-    logger.warn("Health", "Preserve strategy selected but no verified field to read.")
-    return false, "preserve strategy has no verified field"
-
-  elseif strategy == "restore" then
-    -- TODO(discovery): same requirement as "preserve", plus a per-frame write.
-    logger.warn("Health", "Restore strategy selected but no verified field to read.")
-    return false, "restore strategy has no verified field"
+  local ok, detail = ensure_hook()
+  if not ok then
+    logger.error("Health", "Could not hook doDamage: " .. tostring(detail))
+    return false, tostring(detail)
   end
 
-  logger.warn("Health", "No usable strategy. This should be unreachable.")
-  return false, "no strategy"
+  enabled = true
+
+  if use_damage_reaction_flag then
+    M.set_damage_reaction_forbidden(true)
+  end
+
+  logger.info("Health", "Enabled. Damage to the player is suppressed at the source.")
+  return true, nil
 end
 
---- Turn the cheat off and restore normal game behaviour.
+--- Stop suppressing damage.
 --
--- Must be safe to call when the cheat was never enabled, and safe to call twice.
+-- Note this does NOT remove the hook — it cannot, this build has no unhook.
+-- It clears the flag the hook reads.
 function M.disable()
-  if hook_handle ~= nil then
-    -- TODO(discovery): unhook here once a hook exists. Until then this branch
-    -- is unreachable, but leaving it in place documents the contract.
-    hook_handle = nil
+  enabled = false
+
+  if use_damage_reaction_flag then
+    M.set_damage_reaction_forbidden(false)
   end
 
-  baseline = nil
   logger.info("Health", "Disabled. Normal damage behaviour restored.")
 end
 
 --- Per-frame work.
 --
--- Called every frame by main.lua while the cheat is enabled. Returns
--- immediately when unsupported, so an undiscovered build pays no cost.
+-- Deliberately almost empty: damage suppression happens in the hook, at the
+-- moment of the call, rather than by polling. The only work here is keeping the
+-- UI readout current.
 function M.update()
   if not M.is_supported() then
     return
   end
-  if not state.is_active() then
+
+  -- Refresh the displayed value at a low rate. Reading health is cheap, but
+  -- doing it 60 times a second for a number the user cannot read that fast is
+  -- pointless work on the game thread.
+  if logger.frame() % 30 ~= 0 then
     return
   end
 
-  -- TODO(discovery): dispatch on `strategy` here. Intentionally empty: there is
-  -- nothing to do until a real field or method is known, and a placeholder write
-  -- would be exactly the invented behaviour this project forbids.
+  local health = game.health()
+  if health ~= nil then
+    state.runtime.health_current = health.current
+    state.runtime.health_max = health.max
+  end
 end
 
---- Values for the status panel, or nil when unknown.
--- @return table|nil
+--- @return table|nil
 function M.readout()
   if state.runtime.health_current == nil then
     return nil
@@ -174,21 +204,55 @@ function M.readout()
   }
 end
 
---- Called by the discovery subsystem when it has established a real strategy.
--- This is the only legitimate way for the cheat to become functional.
--- @param chosen string  "hook" | "preserve" | "restore"
--- @param reason string  human-readable justification
-function M.set_strategy(chosen, reason)
-  strategy = chosen
-  state.mark_supported("health", reason or ("strategy: " .. tostring(chosen)))
-  logger.info("Health", "Strategy established: " .. tostring(chosen) .. " (" .. tostring(reason) .. ")")
+-- ---------------------------------------------------------------------------
+-- Optional experiment: the damage-reaction flag
+-- ---------------------------------------------------------------------------
+
+--- Toggle app.CharacterCommonStatus.set_isForbidDamageReaction.
+--
+-- Exposed deliberately as an experiment rather than as the default. The method
+-- name says "forbid damage REACTION", which may mean it suppresses the stagger
+-- animation while the health value still drops. That has to be established by
+-- observation, not by reading the name.
+--
+-- Call this, take a hit, and compare get_health() before and after. If health
+-- holds, this is a strictly better mechanism than the hook, because it changes
+-- no code path at all.
+--
+-- @param forbidden boolean
+-- @return boolean ok
+function M.set_damage_reaction_forbidden(forbidden)
+  local status = game.player_status()
+  if status == nil then
+    logger.warn("Health", "Cannot set damage-reaction flag: player status unavailable.")
+    return false
+  end
+
+  local ok, result = safe.call_method(status, "set_isForbidDamageReaction", forbidden == true)
+  if not ok or result == nil then
+    logger.warn("Health", "set_isForbidDamageReaction call did not report success.")
+    return false
+  end
+
+  logger.info("Health", "isForbidDamageReaction set to " .. tostring(forbidden) .. ".")
+  return true
 end
 
---- Reset on scene change / script reset. Drops anything session-specific.
+--- Enable the experiment mode. Used by the developer UI.
+-- @param on boolean
+function M.use_reaction_flag(on)
+  use_damage_reaction_flag = on == true
+  if enabled then
+    M.set_damage_reaction_forbidden(use_damage_reaction_flag)
+  end
+end
+
 function M.reset()
-  strategy = nil
-  baseline = nil
-  hook_handle = nil
+  enabled = false
+  use_damage_reaction_flag = false
+  -- hook_ready is intentionally NOT cleared: the hook cannot be uninstalled,
+  -- so forgetting that it exists would let a later enable() try to install a
+  -- second one on the same method.
 end
 
 return M

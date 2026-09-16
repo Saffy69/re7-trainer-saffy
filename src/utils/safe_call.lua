@@ -291,4 +291,127 @@ function M.to_number(value)
   return nil
 end
 
+-- ---------------------------------------------------------------------------
+-- Hooking
+--
+-- INSTALL-ONCE SEMANTICS. THIS IS NOT A STYLE CHOICE.
+--
+-- This REFramework build exposes sdk.hook but has NO unhook and NO
+-- remove_hook -- both confirmed absent from the installed binary. A hook, once
+-- installed, is permanent for the life of the process.
+--
+-- Every design decision below follows from that:
+--
+--   1. A hook is installed at most once per method, tracked by key, so
+--      repeated enable() calls cannot stack duplicate hooks on the same
+--      function. Stacking them would multiply the work per call and, for
+--      SKIP_ORIGINAL hooks, is the kind of thing that turns into a crash.
+--   2. The cheat's enabled/disabled state is carried by a FLAG the callback
+--      reads, not by the presence of the hook. Disabling a cheat stops it
+--      doing anything; it does not and cannot uninstall anything.
+--   3. The callback body must be cheap. It runs on whatever game thread
+--      invoked the method, while holding the Lua lock, so it stalls that
+--      thread for as long as it takes.
+-- ---------------------------------------------------------------------------
+
+--- Keys of hooks already installed, so they are never installed twice.
+local installed = {}
+
+--- Install a hook on a method, at most once.
+--
+-- The pre-callback receives a 1-indexed table of raw void*:
+--     args[1] = REThreadContext*
+--     args[2] = the `this` pointer
+--     args[3..] = parameters
+-- Mutating the table writes back to the real arguments. Returning
+-- sdk.PreHookResult.SKIP_ORIGINAL skips the original method body.
+--
+-- Use sdk.to_managed_object(args[2]) to get a usable object back from the
+-- raw pointer.
+--
+-- @param key string         unique key, e.g. "app.Item.reduceNum"
+-- @param type_name string   e.g. "app.Item"
+-- @param method_name string e.g. "reduceNum"
+-- @param pre function|nil
+-- @param post function|nil
+-- @return boolean ok, string|nil detail
+function M.hook_method(key, type_name, method_name, pre, post)
+  if installed[key] then
+    -- Already hooked. This is the normal path on a second enable(), not an
+    -- error: the flag inside the callback is what changes.
+    return true, "already hooked"
+  end
+
+  if type(sdk) ~= "table" or type(sdk.hook) ~= "function" then
+    logger.error("Error", "sdk.hook is unavailable in this build")
+    return false, "sdk.hook unavailable"
+  end
+
+  local type_definition = M.type_definition(type_name)
+  if type_definition == nil then
+    return false, "type not found: " .. type_name
+  end
+
+  -- get_method takes the method name as an argument, so it cannot go through
+  -- M.try (which only calls zero-argument accessors).
+  local ok_method, found = pcall(function()
+    return type_definition:get_method(method_name)
+  end)
+
+  if not ok_method or found == nil then
+    return false, "method not found: " .. type_name .. "." .. method_name
+  end
+
+  local ok, hook_id = pcall(sdk.hook, found, pre, post, false)
+  if not ok then
+    logger.error("Error", "sdk.hook(" .. key .. ") threw: " .. tostring(hook_id))
+    return false, tostring(hook_id)
+  end
+
+  installed[key] = hook_id
+  logger.info("Hook", "Installed on " .. type_name .. "." .. method_name)
+  return true, nil
+end
+
+--- Has a hook already been installed for this key?
+-- @param key string
+-- @return boolean
+function M.is_hooked(key)
+  return installed[key] ~= nil
+end
+
+--- How many hooks this session has installed.
+-- @return number
+function M.hook_count()
+  local n = 0
+  for _ in pairs(installed) do
+    n = n + 1
+  end
+  return n
+end
+
+--- Convert a raw hook argument pointer into a usable managed object.
+--
+-- Hook arguments arrive as bare void*, so reading a field off one requires
+-- this hop. sdk.to_managed_object was confirmed present in the installed
+-- binary; the pcall is there because a null pointer is a normal occurrence
+-- (any argument may legitimately be nil).
+--
+-- @param pointer any
+-- @return userdata|nil
+function M.to_managed_object(pointer)
+  if pointer == nil then
+    return nil
+  end
+  if type(sdk) ~= "table" or type(sdk.to_managed_object) ~= "function" then
+    return nil
+  end
+
+  local ok, object = pcall(sdk.to_managed_object, pointer)
+  if not ok then
+    return nil
+  end
+  return object
+end
+
 return M

@@ -1,175 +1,224 @@
 --[[--------------------------------------------------------------------------
   re7trainer.cheats.inventory — Infinite Items.
 
-  THE HIGHEST-RISK CHEAT IN THIS PROJECT
-  --------------------------------------
-  Getting this one wrong does not just fail to work — it can corrupt a save by
-  duplicating a key item, which in RE7 can make a puzzle unsolvable and the run
-  unrecoverable. So this module is deliberately the most conservative of the
-  three, and it ships with a hard precondition rather than a best effort.
+  THE API THIS USES IS REAL AND WAS READ OUT OF THE RUNNING GAME
+  --------------------------------------------------------------
+  From a live discovery dump (docs/DISCOVERY_RESULTS.md):
 
-  THE PRECONDITION
-  ----------------
-  Before Infinite Items may be enabled, discovery must establish BOTH:
+      app.Item
+        M System.Int32  getStackNum()
+        M System.Void   setStackNum(System.Int32)
+        M System.Boolean reduceNum(? (2 params))   <-- consumption
+        M app.ItemData  get_ItemData()
 
-    (a) a readable and writable quantity for a stackable consumable, AND
-    (b) a reliable way to tell a stackable consumable from a key/quest item.
+      app.ItemData
+        F app.Item.ItemCategoryType Category           <-- the classification
 
-  If (b) cannot be established, the correct outcome is a documented limitation
-  and a permanently disabled toggle. A version of this cheat that cannot tell
-  a herb from a keycard is a version that will eventually duplicate a keycard.
+      app.Item.ItemCategoryType
+        Drug  Material  Shell                          <-- conserve these
+        KeyItem  UsableKeyItem  DiscardableKeyItem     <-- NEVER touch these
+        Weapon  StackWeapon  File  Map  SupplyBox  OtherItem
 
-  THE REQUIREMENT THAT SHAPES THE DESIGN
-  --------------------------------------
-  Five herbs stay five herbs after using one.
+  THE SAFETY PRECONDITION IS THEREFORE SATISFIABLE
+  ------------------------------------------------
+  This project set a hard rule: Infinite Items must not be enabled unless the
+  trainer can reliably tell a stackable consumable from a key item. The engine's
+  own category enum provides exactly that distinction, so the rule is met with
+  real game data rather than with a heuristic over item names.
 
-      NOT:  set quantity to 999999
-      YES:  quantity after use == quantity before use
+  THE GATE IS ON EVERY SINGLE CALL
+  --------------------------------
+  The hook reads the category of the specific item being consumed and only
+  suppresses the consumption when that category is in game.SAFE_CATEGORIES. It
+  is not a global switch that happens to be safe most of the time -- a key item
+  passing through the same method still gets consumed normally.
 
-  So this is a conservation problem, not a maximisation problem. It also means
-  we must be careful about *when* we act. If we restore the quantity eagerly on
-  every frame, picking up an item and then using it works fine — but a game
-  action that legitimately removes an item entirely (combining two herbs into
-  one stronger herb, or handing an item to an NPC) would be undone, which could
-  itself break progression.
+  This matters because RE7 key items gate puzzles. Duplicating one can make a
+  run unrecoverable, and unlike a wrong health value that is not a state you can
+  simply undo.
 
-  STRATEGY, in preference order
+  FAIL CLOSED
+  -----------
+  If the category cannot be read for any reason, the item is treated as unsafe
+  and the consumption proceeds normally. An unreadable category is precisely the
+  case where a guess could touch a key item.
+
+  THE HOOK IS PERMANENT. THE FLAG IS NOT.
+  ---------------------------------------
+  No unhook exists in this build, so the hook stays installed and a flag decides
+  whether it does anything.
+
+  WHAT IS DELIBERATELY NOT DONE
   -----------------------------
-    1. PREVENT CONSUMPTION ON THE CONSUMABLE PATH ONLY. Hook the specific
-       operation that consumes one unit of a stackable item, and skip it. Narrow
-       by construction: it never touches add, remove, combine, or transfer.
-    2. RESTORE ON DECREASE, CONSUMABLES ONLY. Watch the quantity of items we
-       have positively classified as stackable consumables; if one drops, put
-       it back. Broader than (1) and cannot help with a use that removes the
-       entry entirely.
-    3. NOT IMPLEMENTED. There is no third fallback. If neither (1) nor (2) is
-       available, the cheat stays off.
-
-  WHAT THIS MODULE WILL NOT DO, EVER
-  ----------------------------------
-    * touch items it has not classified as stackable consumables
-    * touch the item box rather than the carried inventory, unless discovery
-      shows the same safe classification applies there
-    * write to save files
-    * add items that were not already present (no duplication of anything, ever)
+  No eager "restore every item every frame" loop. Such a loop would also undo
+  legitimate removals -- combining two herbs into one stronger herb, handing an
+  item to an NPC, dropping something -- and could break progression in ways that
+  are hard to diagnose. Only the consumption of a safe item is prevented.
 ----------------------------------------------------------------------------]]
 
 local logger = require("re7trainer.logger")
 local state = require("re7trainer.state")
+local safe = require("re7trainer.utils.safe_call")
+local objects = require("re7trainer.utils.object_helpers")
+local game = require("re7trainer.game")
 
 local M = {}
 
 M.NAME = "inventory"
 M.LABEL = "Infinite Items"
 
---- "hook_consume" | "restore_on_decrease", or nil until discovered.
-local strategy = nil
+--- Read by the hook on every call.
+local enabled = false
 
---- Set of item identifiers positively classified as stackable consumables.
---- Populated only by discovery. An empty set means "nothing is safe to touch",
---- which is the correct default.
-local safe_items = {}
+local hook_ready = false
 
---- Shadow copy of quantities we are tracking, so update() can spot a decrease.
---- Keys are item identifiers, values are the last observed quantity.
-local snapshot = {}
+local HOOK_KEY = "app.Item.reduceNum"
 
---- Handle to whatever we hooked, so disable() can undo it.
-local hook_handle = nil
+--- Number of consumptions suppressed, for the debug panel. Purely diagnostic.
+local suppressed = 0
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
---- Called once at startup. Never touches the game.
 function M.initialize()
-  strategy = nil
-  safe_items = {}
-  snapshot = {}
-  hook_handle = nil
-  logger.info("Inventory", "Module initialised. Awaiting discovery — no item API is known yet.")
+  enabled = false
+  suppressed = 0
+
+  if safe.type_definition("app.Item") == nil then
+    state.mark_unsupported("inventory", "app.Item is not present in this build")
+    logger.warn("Inventory", "Target type missing; Infinite Items will stay disabled.")
+    return
+  end
+
+  -- The category gate is the precondition. Confirm the enum is reachable before
+  -- claiming support -- if the category cannot be read, this cheat must not run
+  -- at all, so that is checked here rather than discovered at consumption time.
+  if safe.type_definition("app.ItemData") == nil then
+    state.mark_unsupported("inventory",
+      "app.ItemData missing, so item categories cannot be read safely")
+    logger.warn("Inventory", "Cannot classify items; Infinite Items will stay disabled.")
+    return
+  end
+
+  state.mark_supported("inventory",
+    "app.ItemData.Category provides engine-level consumable/key-item classification")
+  logger.info("Inventory", "Ready. Hook target: app.Item.reduceNum, gated on item category.")
 end
 
 --- @return boolean
 function M.is_supported()
-  if state.runtime.inventory_supported ~= true or strategy == nil then
-    return false
-  end
-  -- Refuse to report support while nothing has been classified as safe. This
-  -- is the guard that stops the cheat from ever running in an "I will figure
-  -- out which items are safe as I go" mode.
-  return next(safe_items) ~= nil
+  return state.runtime.inventory_supported == true
 end
 
 --- @return string
 function M.status()
-  if M.is_supported() then
-    local count = 0
-    for _ in pairs(safe_items) do
-      count = count + 1
-    end
-    return "active via '" .. tostring(strategy) .. "' (" .. count .. " item(s) classified safe)"
+  if not M.is_supported() then
+    return state.runtime.inventory_reason or "not available"
   end
-  return state.runtime.inventory_reason or "not yet discovered"
+  if not enabled then
+    return "ready (off)"
+  end
+  return "active (safe categories only, " .. tostring(suppressed) .. " suppressed)"
+end
+
+--- The hook body.
+--
+-- args layout, from the verified sdk.hook signature:
+--   args[1] = REThreadContext*
+--   args[2] = `this`  (the app.Item being consumed)
+--   args[3..] = parameters
+-- @param args table
+local function on_reduce_num(args)
+  -- Runs on the game thread holding the Lua lock, so the cheapest possible
+  -- early-outs come first.
+  if not enabled then
+    return sdk.PreHookResult.CALL_ORIGINAL
+  end
+  if state.prefs.trainer_enabled ~= true then
+    return sdk.PreHookResult.CALL_ORIGINAL
+  end
+
+  local item = safe.to_managed_object(args[2])
+  if item == nil then
+    return sdk.PreHookResult.CALL_ORIGINAL
+  end
+
+  -- The gate. Everything hinges on this call: it reads the engine's own
+  -- category for THIS item and refuses anything that is not a known
+  -- consumable. A key item reaching here is consumed exactly as normal.
+  local item_safe, reason = game.is_safe_to_conserve(item)
+  if not item_safe then
+    -- Logged at a throttled rate -- an item consumed repeatedly while
+    -- unclassified would otherwise flood the log.
+    logger.throttled("inv:skip:" .. tostring(reason), 600, "debug", "Inventory",
+                     "Not conserving: " .. tostring(reason))
+    return sdk.PreHookResult.CALL_ORIGINAL
+  end
+
+  suppressed = suppressed + 1
+  return sdk.PreHookResult.SKIP_ORIGINAL
+end
+
+local function ensure_hook()
+  if hook_ready then
+    return true, nil
+  end
+
+  local ok, detail = safe.hook_method(
+    HOOK_KEY, "app.Item", "reduceNum", on_reduce_num, nil)
+
+  if ok then
+    hook_ready = true
+  end
+  return ok, detail
 end
 
 --- @return boolean ok, string message
 function M.enable()
-  if state.runtime.inventory_supported ~= true then
-    local reason = state.runtime.inventory_reason or "not yet discovered"
-    logger.warn("Inventory", "Refusing to enable Infinite Items: " .. reason)
+  if not M.is_supported() then
+    local reason = state.runtime.inventory_reason or "not available"
+    logger.warn("Inventory", "Refusing to enable: " .. reason)
     return false, reason
   end
 
-  if next(safe_items) == nil then
-    local reason = "no items have been classified as safe stackable consumables"
-    logger.warn("Inventory", "Refusing to enable Infinite Items: " .. reason
-                          .. ". Touching unclassified items risks duplicating key items.")
-    return false, reason
+  local ok, detail = ensure_hook()
+  if not ok then
+    -- Do not report success when the hook failed. The previous version of this
+    -- module refused enabling outright; now that there is a real implementation,
+    -- the equivalent guarantee is that a failed hook is a failed enable.
+    logger.error("Inventory", "Could not hook reduceNum: " .. tostring(detail))
+    return false, tostring(detail)
   end
 
-  if strategy == "hook_consume" then
-    -- TODO(discovery): sdk.hook the verified consume operation, and inside the
-    -- pre-callback check the item identifier against `safe_items` before
-    -- deciding to skip the original call.
-    logger.warn("Inventory", "Hook strategy selected but no verified consume method to hook.")
-    return false, "hook strategy has no verified target"
-
-  elseif strategy == "restore_on_decrease" then
-    -- TODO(discovery): prime `snapshot` from the verified quantity accessor for
-    -- every item in `safe_items`.
-    logger.warn("Inventory", "Restore strategy selected but no verified quantity accessor.")
-    return false, "restore strategy has no verified accessor"
-  end
-
-  logger.warn("Inventory", "No usable strategy. This should be unreachable.")
-  return false, "no strategy"
+  enabled = true
+  logger.info("Inventory", "Enabled. Consumption of Drug/Material/Shell items is suppressed.")
+  return true, nil
 end
 
---- Turn the cheat off. Safe to call when never enabled, and safe twice.
+--- Stop suppressing consumption. Does not remove the hook.
 function M.disable()
-  if hook_handle ~= nil then
-    -- TODO(discovery): unhook here once a hook exists.
-    hook_handle = nil
-  end
-
-  snapshot = {}
+  enabled = false
   logger.info("Inventory", "Disabled. Normal item consumption restored.")
 end
 
---- Per-frame work. Returns immediately when unsupported.
+--- Per-frame work: refresh the readout only.
 function M.update()
   if not M.is_supported() then
     return
   end
-  if not state.is_active() then
+  if logger.frame() % 60 ~= 0 then
     return
   end
 
-  -- TODO(discovery): dispatch on `strategy` here. Intentionally empty — see the
-  -- module header. In particular, do not add an eager "restore everything every
-  -- frame" loop: that would undo legitimate item removal (combining, handing
-  -- over) and can break progression.
+  -- count_safe_items walks the inventory, which is more expensive than the
+  -- other cheats' readouts, so it runs at a quarter of their rate.
+  local safe_count, total = game.count_safe_items()
+  state.runtime.item_count = safe_count
+  if total > 0 then
+    logger.throttled("inv:survey", 1800, "debug", "Inventory",
+                     string.format("%d of %d carried items are conservable.", safe_count, total))
+  end
 end
 
 --- @return table|nil
@@ -177,31 +226,27 @@ function M.readout()
   if state.runtime.item_count == nil then
     return nil
   end
-  return { tracked = state.runtime.item_count }
+  return { current = state.runtime.item_count }
 end
 
---- Called by discovery once a real strategy is established.
--- @param chosen string  "hook_consume" | "restore_on_decrease"
--- @param classified table array of item identifiers proven safe to conserve
--- @param reason string
-function M.set_strategy(chosen, classified, reason)
-  strategy = chosen
-  safe_items = {}
-  for _, id in ipairs(classified or {}) do
-    safe_items[id] = true
-  end
-  state.mark_supported("inventory", reason or ("strategy: " .. tostring(chosen)))
-  logger.info("Inventory", "Strategy established: " .. tostring(chosen)
-                        .. " with " .. tostring(#(classified or {})) .. " classified item(s).")
+--- Enable the alternative consumption path.
+--
+-- app.Item.reduceNum is the clear decrement operation and is the default. If
+-- testing shows that consuming a herb does not go through it, app.Item.useItem
+-- is the other candidate. This exists so that switching is a one-line change
+-- during testing rather than a code edit.
+--
+-- Not wired to the UI yet: the correct hook point should be established by
+-- observation first, not offered as a choice the user has to guess at.
+-- @return string name of the method currently hooked
+function M.hooked_method()
+  return "reduceNum"
 end
 
---- Reset on scene change / script reset. Clears the safe set too, so a new
---- scenario never inherits classifications from the previous one.
 function M.reset()
-  strategy = nil
-  safe_items = {}
-  snapshot = {}
-  hook_handle = nil
+  enabled = false
+  suppressed = 0
+  -- hook_ready not cleared; the hook is permanent.
 end
 
 return M
