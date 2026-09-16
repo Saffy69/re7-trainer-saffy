@@ -333,7 +333,7 @@ local function draw_item_classification()
       shown = shown + 1
 
       local id = require("re7trainer.utils.object_helpers").get(item, "ItemDataID")
-      local category, observation = game.item_category(item)
+      local category, observation, numeric = game.item_category(item)
       local safe_to_conserve, reason = game.is_safe_to_conserve(item)
       local stack = game.item_stack(item)
 
@@ -341,13 +341,15 @@ local function draw_item_classification()
               tostring(id or "?"),
               stack and string.format("%.0f", stack) or "?"))
 
-      W.text(string.format("      category=%s  (%s)",
-              category or "UNREADABLE", tostring(observation)))
+      W.text(string.format("      category: value=%s %s (%s)",
+              numeric ~= nil and tostring(numeric) or "?",
+              category or "unnamed",
+              tostring(observation)))
 
       if safe_to_conserve then
-        W.text("      -> conservable: " .. tostring(reason))
+        W.text("      -> CONSERVED: " .. tostring(reason))
       else
-        W.text("      -> NOT conservable: " .. tostring(reason))
+        W.text("      -> not conserved: " .. tostring(reason))
       end
     end
   end
