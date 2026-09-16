@@ -20,6 +20,7 @@ local W = require("re7trainer.utils.imgui_safe")
 local state = require("re7trainer.state")
 local logger = require("re7trainer.logger")
 local objects = require("re7trainer.utils.object_helpers")
+local safe = require("re7trainer.utils.safe_call")
 local config = require("re7trainer.config")
 
 local M = {}
@@ -139,6 +140,61 @@ local function draw_controls()
   end
 end
 
+--- Draw the RE7 object-access block.
+--
+-- This is the panel that answers "is the trainer actually reaching the game?"
+-- without needing to read a log. Every line corresponds to one hop in the
+-- verified access chain, so a failure points at an exact step.
+local function draw_game_access()
+  local game = require("re7trainer.game")
+
+  W.spacing()
+  W.text("RE7 object access")
+
+  local inventory = game.inventory()
+  W.field("  app.Inventory", inventory ~= nil and "reached" or "NOT reached")
+  if inventory == nil then
+    W.muted("no route to the player inventory; cheats cannot act")
+    return
+  end
+
+  local status = game.player_status()
+  W.field("  PlayerStatus", status ~= nil and "reached" or "NOT reached")
+
+  local health = game.health()
+  if health ~= nil then
+    W.field("  health", string.format("%.1f / %s",
+            health.current,
+            health.max and string.format("%.1f", health.max) or "?"))
+  else
+    W.field("  health", "unreadable")
+  end
+
+  local dead = game.is_dead()
+  if dead ~= nil then
+    W.field("  IsDead", tostring(dead))
+  end
+
+  local gun = game.equipped_gun()
+  W.field("  equipped gun", gun ~= nil and "reached" or "none / not reached")
+
+  local ammo = game.gun_ammo(gun)
+  if ammo ~= nil then
+    W.field("  magazine", string.format("%.0f / %s",
+            ammo.magazine,
+            ammo.magazine_max and string.format("%.0f", ammo.magazine_max) or "?"))
+    W.field("  reserve", ammo.reserve and string.format("%.0f", ammo.reserve) or "?")
+  end
+
+  -- The item classification is the precondition for Infinite Items, so its
+  -- state is shown explicitly rather than implied by the toggle being live.
+  local safe_count, total = game.count_safe_items()
+  W.field("  items conservable", string.format("%d of %d", safe_count, total))
+  W.muted("only Drug / Material / Shell are ever conserved")
+
+  W.field("  hooks installed", tostring(safe.hook_count()))
+end
+
 --- Draw the whole debug panel.
 function M.draw()
   if not W.available() then
@@ -148,6 +204,7 @@ function M.draw()
   draw_environment()
   draw_discovery_state()
   draw_live_values()
+  draw_game_access()
   draw_candidates()
   draw_controls()
 end

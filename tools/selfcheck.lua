@@ -103,6 +103,13 @@ local function make_type(full_name, parent_name, methods, fields)
     if self.parent_name == nil then return nil end
     return TYPE_DB[self.parent_name]
   end
+  -- get_method is what safe_call.hook_method uses to resolve a hook target.
+  t.get_method      = function(self, name)
+    for _, m in ipairs(self.methods) do
+      if m:get_name() == name then return m end
+    end
+    return nil
+  end
   return t
 end
 
@@ -117,6 +124,11 @@ local function make_method(name, return_type, params, is_static)
   end
   m.get_num_params  = function() return #(params or {}) end
   m.is_static       = function() return is_static == true end
+  -- REMethodDefinition registers `call` in the real binary (confirmed in the
+  -- registration block). game.inventory() uses it for the static
+  -- getActivePlayerInventory, so the stub must provide it or that route
+  -- silently appears broken.
+  m.call            = function(_, ...) return nil end
   return m
 end
 
@@ -136,9 +148,37 @@ TYPE_DB["app.PlayerStatus"] = make_type("app.PlayerStatus", nil,
     make_field("MaxHealth", "System.Single") })
 
 TYPE_DB["app.PlayerDamageController"] = make_type("app.PlayerDamageController", nil,
-  { make_method("applyDamage", "System.Void", { "System.Single", "System.Int32" }),
+  { make_method("doDamage", "System.Void", { "app.Collision.HitController.DamageInfo" }),
+    make_method("applyDamage", "System.Void", { "System.Single", "System.Int32" }),
     make_method("isInvincible", "System.Boolean", {}) },
   { make_field("DamageRate", "System.Single") })
+
+-- Types the implemented cheats hook. Present so the selfcheck exercises the
+-- real enable/disable paths rather than skipping them.
+TYPE_DB["app.Item"] = make_type("app.Item", nil,
+  { make_method("reduceNum", "System.Boolean", { "System.Int32", "System.Boolean" }),
+    make_method("useItem", "System.Boolean", { "System.Int32" }),
+    make_method("getStackNum", "System.Int32", {}),
+    make_method("get_ItemData", "app.ItemData", {}) },
+  { make_field("ItemStackNum", "System.Int32"),
+    make_field("_ItemData", "app.ItemData") })
+
+TYPE_DB["app.ItemData"] = make_type("app.ItemData", nil,
+  { make_method("getSlotNum", "System.Int32", {}) },
+  { make_field("Category", "app.Item.ItemCategoryType"),
+    make_field("MaxStackNum", "System.Int32") })
+
+TYPE_DB["app.WeaponGun"] = make_type("app.WeaponGun", nil,
+  { make_method("expendBullet", "System.Boolean", {}),
+    make_method("get_loadNum", "System.Int32", {}),
+    make_method("set_loadNum", "System.Void", { "System.Int32" }) },
+  { make_field("Inventory", "app.Inventory") })
+
+TYPE_DB["app.Inventory"] = make_type("app.Inventory", nil,
+  { make_method("getActivePlayerInventory", "app.Inventory", {}),
+    make_method("get_ItemList", "System.Collections.Generic.List`1<app.Inventory.ItemInfo>", {}) },
+  { make_field("PlayerStatus", "app.IPlayerStatus"),
+    make_field("_ItemList", "System.Collections.Generic.List`1<app.Inventory.ItemInfo>") })
 
 TYPE_DB["app.PlayerGun"] = make_type("app.PlayerGun", nil,
   { make_method("get_Ammo", "System.Int32", {}),
@@ -151,11 +191,55 @@ TYPE_DB["app.InventoryManager"] = make_type("app.InventoryManager", nil,
     make_method("useItem", "System.Boolean", { "System.Int32" }) },
   { make_field("ItemList", "System.Collections.Generic.List`1<app.Item>") })
 
-local CONSTRUCTED_SINGLETONS = {
-  ["app.InventoryManager"] = {
-    get_type_definition = function() return TYPE_DB["app.InventoryManager"] end,
-  },
+local CONSTRUCTED_SINGLETONS = {}
+
+--- A minimal stand-in for a live app.Inventory.
+--
+-- Has to behave like a managed object -- get_field and call -- or the access
+-- chain above it appears broken when it is only the stub that is thin. An
+-- earlier version was a bare table and produced error-level log lines that
+-- looked like real faults.
+local function fake_inventory()
+  return {
+    get_type_definition = function()
+      return { get_full_name = function() return "app.Inventory" end }
+    end,
+    get_field = function(_, name)
+      if name == "PlayerStatus" then
+        return {
+          get_type_definition = function()
+            return TYPE_DB["app.PlayerStatus"]
+          end,
+          get_field = function() return nil end,
+          call = function(_, method)
+            if method == "get_health" then return 100.0 end
+            if method == "get_maxHealth" then return 100.0 end
+            if method == "get_normalizedHealth" then return 1.0 end
+            if method == "get_IsDead" then return false end
+            return nil
+          end,
+        }
+      end
+      if name == "_ItemList" then return {} end
+      return nil
+    end,
+    call = function(_, method)
+      if method == "get_ItemList" then return {} end
+      return nil
+    end,
+  }
+end
+
+CONSTRUCTED_SINGLETONS["app.InventoryManager"] = {
+  get_type_definition = function() return TYPE_DB["app.InventoryManager"] end,
+  get_field = function(_, name)
+    if name == "_Inventory" then return fake_inventory() end
+    return nil
+  end,
+  call = function() return nil end,
 }
+
+local HOOKS_INSTALLED = {}
 
 sdk = {
   get_managed_singleton = function(name) return CONSTRUCTED_SINGLETONS[name] end,
@@ -164,6 +248,16 @@ sdk = {
   to_float              = function(v) return tonumber(v) end,
   to_double             = function(v) return tonumber(v) end,
   to_int64              = function(v) return tonumber(v) end,
+  to_managed_object     = function(v) return v end,
+  -- Record installations so the selfcheck can assert install-once semantics,
+  -- which is a real correctness property: this build has no unhook, so a
+  -- duplicate hook on the same method can never be undone.
+  hook = function(method, pre, post, ignore_jmp)
+    local id = #HOOKS_INSTALLED + 1
+    HOOKS_INSTALLED[id] = { method = method, pre = pre, post = post }
+    return id
+  end,
+  PreHookResult = { CALL_ORIGINAL = 0, SKIP_ORIGINAL = 1 },
 }
 
 -- ---------------------------------------------------------------------------
@@ -341,7 +435,8 @@ do
   -- check and removing a required one does not silently pass.
   local REQUIRED = {
     "re7trainer.main", "re7trainer.logger", "re7trainer.state",
-    "re7trainer.config", "re7trainer.utils.safe_call",
+    "re7trainer.config", "re7trainer.game",
+    "re7trainer.utils.safe_call",
     "re7trainer.utils.object_helpers", "re7trainer.utils.type_helpers",
     "re7trainer.utils.imgui_safe", "re7trainer.ui.menu",
     "re7trainer.cheats.health", "re7trainer.cheats.ammo",
@@ -464,6 +559,146 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+-- Cheat lifecycle and hook semantics
+--
+-- This build has NO unhook, so hooks are permanent and install-once is a
+-- correctness property rather than an optimisation: a duplicate hook on the
+-- same method could never be undone. These cases assert that, and assert that
+-- disabling actually stops the behaviour (via the flag the callback reads)
+-- rather than merely appearing to.
+-- ---------------------------------------------------------------------------
+
+io.write("\ncheat lifecycle\n")
+do
+  local state = require("re7trainer.state")
+  local prefs = state.prefs
+  prefs.trainer_enabled = true
+
+  local health = require("re7trainer.cheats.health")
+  local ammo = require("re7trainer.cheats.ammo")
+  local inventory = require("re7trainer.cheats.inventory")
+
+  health.initialize()
+  ammo.initialize()
+  inventory.initialize()
+
+  check("health reports supported", health.is_supported())
+  check("ammo reports supported", ammo.is_supported())
+  check("inventory reports supported", inventory.is_supported())
+
+  local before = #HOOKS_INSTALLED
+
+  check("health enables", (health.enable()))
+  check("ammo enables", (ammo.enable()))
+  check("inventory enables", (inventory.enable()))
+
+  check("three hooks installed", #HOOKS_INSTALLED == before + 3,
+        string.format("%d installed", #HOOKS_INSTALLED - before))
+
+  -- Re-enabling must NOT stack a second hook on the same method.
+  health.enable()
+  ammo.enable()
+  inventory.enable()
+  check("re-enable does not stack hooks", #HOOKS_INSTALLED == before + 3,
+        string.format("%d installed", #HOOKS_INSTALLED - before))
+
+  -- Locate an installed hook by the method it was attached to. Matching on the
+  -- method object is exact, unlike guessing from the callback's name.
+  local function hook_for(type_name, method_name)
+    local td = TYPE_DB[type_name]
+    if td == nil then return nil end
+    local m = td:get_method(method_name)
+    for _, h in pairs(HOOKS_INSTALLED) do
+      if h.method == m then return h end
+    end
+    return nil
+  end
+
+  local dmg = hook_for("app.PlayerDamageController", "doDamage")
+  check("health hook is on doDamage", dmg ~= nil)
+  if dmg then
+    check("health pre skips while enabled",
+          dmg.pre({}) == sdk.PreHookResult.SKIP_ORIGINAL)
+    health.disable()
+    check("health pre calls through while disabled",
+          dmg.pre({}) == sdk.PreHookResult.CALL_ORIGINAL)
+    health.enable()
+  end
+
+  local exp = hook_for("app.WeaponGun", "expendBullet")
+  check("ammo hook is on expendBullet", exp ~= nil)
+  if exp then
+    check("ammo pre skips while enabled",
+          exp.pre({}) == sdk.PreHookResult.SKIP_ORIGINAL)
+    ammo.disable()
+    check("ammo pre calls through while disabled",
+          exp.pre({}) == sdk.PreHookResult.CALL_ORIGINAL)
+    ammo.enable()
+  end
+
+  local red = hook_for("app.Item", "reduceNum")
+  check("inventory hook is on reduceNum", red ~= nil)
+
+  if red then
+    -- A fake app.Item whose category we control. This is the safety-critical
+    -- path: a key item MUST NOT be conserved even while the cheat is on.
+    --
+    -- The stub mirrors how REFramework exposes a managed object: fields are
+    -- read through get_field, not through plain Lua table indexing. An earlier
+    -- version of this fake was a bare table, and the production code correctly
+    -- refused to treat it as safe -- which is the fail-closed behaviour working
+    -- as designed, and worth keeping in mind when reading a failure here.
+    local function fake_item_data(category)
+      return {
+        get_type_definition = function()
+          return { get_full_name = function() return "app.ItemData" end }
+        end,
+        get_field = function(_, name)
+          if name == "Category" then return category end
+          return nil
+        end,
+        call = function() return nil end,
+      }
+    end
+
+    local function fake_item(category)
+      return {
+        get_type_definition = function()
+          return { get_full_name = function() return "app.Item" end }
+        end,
+        call = function(_, name)
+          if name == "get_ItemData" then return fake_item_data(category) end
+          return nil
+        end,
+        get_field = function(_, name)
+          if name == "_ItemData" then return fake_item_data(category) end
+          return nil
+        end,
+      }
+    end
+
+    check("drug is conserved while enabled",
+          red.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.SKIP_ORIGINAL)
+
+    check("KeyItem is NOT conserved while enabled",
+          red.pre({ [1] = nil, [2] = fake_item("KeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("UsableKeyItem is NOT conserved while enabled",
+          red.pre({ [1] = nil, [2] = fake_item("UsableKeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("Weapon is NOT conserved while enabled",
+          red.pre({ [1] = nil, [2] = fake_item("Weapon") }) == sdk.PreHookResult.CALL_ORIGINAL)
+
+    -- Fail closed: an unreadable category must not be treated as safe.
+    check("unreadable category is NOT conserved",
+          red.pre({ [1] = nil, [2] = fake_item(nil) }) == sdk.PreHookResult.CALL_ORIGINAL)
+
+    inventory.disable()
+    check("nothing is conserved while disabled",
+          red.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    inventory.enable()
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Report
 -- ---------------------------------------------------------------------------
 
@@ -473,6 +708,18 @@ for _, entry in ipairs(log_lines) do
 end
 
 io.write(string.format("\nlog lines: %d  (errors: %d)\n", #log_lines, errors))
+
+-- Print error-level lines in full rather than only counting them. A count that
+-- nobody can act on is worse than no count: it invites either ignoring a real
+-- fault or chasing a phantom.
+if errors > 0 then
+  io.write("\nerror-level log output:\n")
+  for _, entry in ipairs(log_lines) do
+    if entry.level == "error" then
+      io.write("  " .. tostring(entry.message) .. "\n")
+    end
+  end
+end
 
 io.write(string.format("\n%d checks, %d failed\n", checks, failures))
 os.exit(failures == 0 and 0 or 1)

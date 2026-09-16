@@ -1,140 +1,164 @@
 --[[--------------------------------------------------------------------------
   re7trainer.cheats.ammo — Infinite Ammo.
 
-  READ THIS BEFORE ASSUMING IT DOES ANYTHING
-  ------------------------------------------
-  Structurally complete, functionally empty. Same reasoning as
-  re7trainer.cheats.health: we know the weapon TYPE names
-  (app.PlayerGun, app.PlayerWeaponChange, app.PlayerReloadSpeedRateTable, ...)
-  from the user's own type dump, and we know nothing whatsoever about their
-  members.
+  THE API THIS USES IS REAL AND WAS READ OUT OF THE RUNNING GAME
+  --------------------------------------------------------------
+  From a live discovery dump (docs/DISCOVERY_RESULTS.md):
 
-  THE REQUIREMENT THAT SHAPES THE DESIGN
-  --------------------------------------
-  Firing must leave the count unchanged. Twelve rounds stays twelve.
+      app.WeaponGun
+        M System.Boolean expendBullet()          <-- 0 params. The consumption op.
+        M System.Int32   get_loadNum()           <-- magazine
+        M System.Void    set_loadNum(System.Int32)
+        M System.Int32   get_bulletStackNum()    <-- reserve
+        M System.Boolean get_isLoadNumInfinity()
+        M System.Boolean get_isBulletStackNumInfinity()
 
-      NOT:  set ammo to 999999
-      YES:  after firing, ammo is still 12
+  STRATEGY: prevent consumption, do not rewrite a value.
+  -----------------------------------------------------
+      sdk.hook(expendBullet, pre = SKIP_ORIGINAL when enabled, post = nil)
 
-  Those are different interventions and only the second is wanted. Setting a
-  large constant would also look wrong in the HUD, break the "you are nearly
-  out" tension the game is built around, and is exactly the kind of blunt
-  change that can desync from a separate reserve count.
+  This is the project's stated requirement implemented literally: firing leaves
+  the count unchanged, because the operation that would have changed it never
+  runs. Twelve rounds stays twelve — not 999999.
 
-  STRATEGY, in preference order
-  -----------------------------
-    1. PREVENT CONSUMPTION. Hook whichever operation decrements the magazine
-       and skip it. The count is never written by us at all, so there is no
-       window in which a wrong value is visible.
-    2. CAPTURE AND RESTORE. Read the count immediately before and after the
-       fire operation and rewrite it if it dropped. Requires a readable AND
-       writable field, and introduces one frame where the HUD may show the
-       decremented value.
-    3. HOLD AT BASELINE. Record the count when enabled and rewrite it every
-       frame. Crudest, most visible, last resort — and it would also undo any
-       legitimate ammo pickup, which is why it is last.
+  Setting a large constant was rejected on purpose. It would look wrong in the
+  HUD, it desynchronises from the reserve count, and it is a strictly larger
+  intervention than simply not decrementing.
 
-  "No Reload" is deliberately NOT implemented. It was not requested, and
-  suppressing reload would change weapon behaviour beyond what was asked for.
+  `expendBullet` returns System.Boolean. When the original body is skipped the
+  return slot is left at its default, i.e. false — which reads as "no bullet was
+  expended". That happens to be the semantically correct answer, but it is worth
+  noting because it is not something the hook arranges deliberately.
 
-  A NOTE ON WHICH QUANTITY WE MEAN
-  --------------------------------
-  Magazine ammo, reserve ammo, and the inventory ammo stack are three different
-  things. This module targets the magazine — the thing that goes down when you
-  pull the trigger — because that is what the stated requirement describes.
-  If discovery shows the magazine is not separately addressable, that gets
-  documented as a limitation rather than silently redirected to a different
-  counter that would produce a different behaviour from the one asked for.
+  THE HOOK IS PERMANENT. THE FLAG IS NOT.
+  ---------------------------------------
+  No unhook exists in this build. The hook is installed once and gated on a
+  flag; disable() clears the flag rather than removing anything.
+
+  WHAT IS NOT TOUCHED
+  -------------------
+  Reload behaviour is left entirely alone — "No Reload" was not requested and
+  suppressing it would change weapon handling beyond what was asked for. The
+  reserve count is not modified either; only the consumption of a round from the
+  magazine is prevented.
 ----------------------------------------------------------------------------]]
 
 local logger = require("re7trainer.logger")
 local state = require("re7trainer.state")
+local safe = require("re7trainer.utils.safe_call")
+local game = require("re7trainer.game")
 
 local M = {}
 
 M.NAME = "ammo"
 M.LABEL = "Infinite Ammo"
 
---- "hook" | "capture_restore" | "hold_baseline", or nil until discovered.
-local strategy = nil
+--- Read by the hook on every call.
+local enabled = false
 
---- Value captured at enable time, for the restore/baseline strategies.
-local baseline = nil
+local hook_ready = false
 
---- Handle to whatever we hooked, so disable() can undo it.
-local hook_handle = nil
+local HOOK_KEY = "app.WeaponGun.expendBullet"
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
---- Called once at startup. Never touches the game.
 function M.initialize()
-  strategy = nil
-  baseline = nil
-  hook_handle = nil
-  logger.info("Ammo", "Module initialised. Awaiting discovery — no ammo API is known yet.")
+  enabled = false
+
+  if safe.type_definition("app.WeaponGun") == nil then
+    state.mark_unsupported("ammo", "app.WeaponGun is not present in this build")
+    logger.warn("Ammo", "Target type missing; Infinite Ammo will stay disabled.")
+    return
+  end
+
+  state.mark_supported("ammo", "app.WeaponGun.expendBullet discovered")
+  logger.info("Ammo", "Ready. Hook target: app.WeaponGun.expendBullet")
 end
 
 --- @return boolean
 function M.is_supported()
-  return state.runtime.ammo_supported == true and strategy ~= nil
+  return state.runtime.ammo_supported == true
 end
 
 --- @return string
 function M.status()
-  if M.is_supported() then
-    return "active via '" .. tostring(strategy) .. "' strategy"
+  if not M.is_supported() then
+    return state.runtime.ammo_reason or "not available"
   end
-  return state.runtime.ammo_reason or "not yet discovered"
+  if not enabled then
+    return "ready (off)"
+  end
+  return hook_ready and "active (rounds not consumed)" or "enabling..."
+end
+
+local function ensure_hook()
+  if hook_ready then
+    return true, nil
+  end
+
+  local ok, detail = safe.hook_method(
+    HOOK_KEY,
+    "app.WeaponGun",
+    "expendBullet",
+    function()
+      -- Runs on the game thread holding the Lua lock; keep it minimal.
+      if not enabled then
+        return sdk.PreHookResult.CALL_ORIGINAL
+      end
+      if state.prefs.trainer_enabled ~= true then
+        return sdk.PreHookResult.CALL_ORIGINAL
+      end
+      return sdk.PreHookResult.SKIP_ORIGINAL
+    end,
+    nil
+  )
+
+  if ok then
+    hook_ready = true
+  end
+  return ok, detail
 end
 
 --- @return boolean ok, string message
 function M.enable()
   if not M.is_supported() then
-    local reason = state.runtime.ammo_reason or "not yet discovered"
-    logger.warn("Ammo", "Refusing to enable Infinite Ammo: " .. reason)
+    local reason = state.runtime.ammo_reason or "not available"
+    logger.warn("Ammo", "Refusing to enable: " .. reason)
     return false, reason
   end
 
-  if strategy == "hook" then
-    -- TODO(discovery): sdk.hook the verified consumption method.
-    logger.warn("Ammo", "Hook strategy selected but no verified method to hook.")
-    return false, "hook strategy has no verified target"
-
-  elseif strategy == "capture_restore" or strategy == "hold_baseline" then
-    -- TODO(discovery): read the verified magazine field into `baseline`.
-    logger.warn("Ammo", "Restore strategy selected but no verified field to read.")
-    return false, "restore strategy has no verified field"
+  local ok, detail = ensure_hook()
+  if not ok then
+    logger.error("Ammo", "Could not hook expendBullet: " .. tostring(detail))
+    return false, tostring(detail)
   end
 
-  logger.warn("Ammo", "No usable strategy. This should be unreachable.")
-  return false, "no strategy"
+  enabled = true
+  logger.info("Ammo", "Enabled. Firing will not consume rounds.")
+  return true, nil
 end
 
---- Turn the cheat off. Safe to call when never enabled, and safe twice.
+--- Stop suppressing consumption. Does not remove the hook.
 function M.disable()
-  if hook_handle ~= nil then
-    -- TODO(discovery): unhook here once a hook exists.
-    hook_handle = nil
-  end
-
-  baseline = nil
+  enabled = false
   logger.info("Ammo", "Disabled. Normal ammo consumption restored.")
 end
 
---- Per-frame work. Returns immediately when unsupported.
+--- Per-frame work: refresh the readout only.
 function M.update()
   if not M.is_supported() then
     return
   end
-  if not state.is_active() then
+  if logger.frame() % 30 ~= 0 then
     return
   end
 
-  -- TODO(discovery): dispatch on `strategy` here. Intentionally empty — see the
-  -- module header. A placeholder write to an unverified field is exactly the
-  -- invented behaviour this project forbids.
+  local ammo = game.gun_ammo()
+  if ammo ~= nil then
+    state.runtime.ammo_current = ammo.magazine
+  end
 end
 
 --- @return table|nil
@@ -145,20 +169,10 @@ function M.readout()
   return { current = state.runtime.ammo_current }
 end
 
---- Called by discovery once a real strategy is established.
--- @param chosen string  "hook" | "capture_restore" | "hold_baseline"
--- @param reason string
-function M.set_strategy(chosen, reason)
-  strategy = chosen
-  state.mark_supported("ammo", reason or ("strategy: " .. tostring(chosen)))
-  logger.info("Ammo", "Strategy established: " .. tostring(chosen) .. " (" .. tostring(reason) .. ")")
-end
-
---- Reset on scene change / script reset.
 function M.reset()
-  strategy = nil
-  baseline = nil
-  hook_handle = nil
+  enabled = false
+  -- hook_ready not cleared: the hook is permanent, so re-installing on a later
+  -- enable() would stack a second hook on the same method.
 end
 
 return M
