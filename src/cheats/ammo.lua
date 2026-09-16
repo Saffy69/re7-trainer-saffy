@@ -52,6 +52,12 @@ local baseline = nil
 --- Number of rounds restored, for the debug panel.
 local restores = 0
 
+--- Write attempts that did not change the value, and the last reason.
+-- Kept separate from restores so the panel can tell a working cheat from one
+-- calling a setter that silently does nothing.
+local write_failures = 0
+local last_write_error = nil
+
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
@@ -90,7 +96,12 @@ function M.status()
   if state.runtime.ammo_current == nil then
     return "enabled, waiting for a weapon"
   end
-  return "active (" .. tostring(restores) .. " restored)"
+
+  if write_failures > 0 and restores == 0 then
+    return "NOT WORKING -- " .. tostring(last_write_error or "writes have no effect")
+  end
+
+  return string.format("active (%d restored, %d failed)", restores, write_failures)
 end
 
 --- @return boolean ok, string message
@@ -161,10 +172,18 @@ function M.update()
   end
 
   if ammo.magazine < baseline then
-    if game.set_magazine(baseline) then
+    local ok, detail = game.set_magazine(baseline)
+    if ok then
       restores = restores + 1
+      last_write_error = nil
       logger.throttled("ammo:restore", 300, "debug", "Ammo",
-                       string.format("Restored magazine %d -> %d", ammo.magazine, baseline))
+                       string.format("Restored magazine %d -> %d via %s",
+                                     ammo.magazine, baseline, tostring(detail)))
+    else
+      write_failures = write_failures + 1
+      last_write_error = tostring(detail)
+      logger.throttled("ammo:writefail", 600, "warn", "Ammo",
+                       "Could not restore the magazine: " .. tostring(detail))
     end
   else
     -- A reload or a pickup. Accept it as the new baseline, otherwise the cheat
@@ -185,6 +204,8 @@ function M.reset()
   enabled = false
   baseline = nil
   restores = 0
+  write_failures = 0
+  last_write_error = nil
 end
 
 return M

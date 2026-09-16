@@ -66,6 +66,12 @@ local baseline = nil
 --- How many times damage has been undone, for the debug panel.
 local restores = 0
 
+--- Write attempts that did not actually change the value, and the last reason.
+-- Tracked separately from restores so the panel can distinguish "working" from
+-- "calling a setter that does nothing", which looked identical last time.
+local write_failures = 0
+local last_write_error = nil
+
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
@@ -117,7 +123,14 @@ function M.status()
   if state.runtime.health_current == nil then
     return "enabled, waiting for the player object"
   end
-  return "active (" .. tostring(restores) .. " restored)"
+
+  if write_failures > 0 and restores == 0 then
+    -- The mechanism is running but every write is being ignored. Saying
+    -- "active" here would repeat the mistake this cheat already made once.
+    return "NOT WORKING -- " .. tostring(last_write_error or "writes have no effect")
+  end
+
+  return string.format("active (%d restored, %d failed)", restores, write_failures)
 end
 
 --- @return boolean ok, string message
@@ -196,14 +209,22 @@ function M.update()
   end
 
   if health.current < baseline then
-    -- Damage was applied since the last frame. Put it back.
-    if game.set_health(baseline) then
+    -- Damage was applied since the last frame. Put it back -- and only count it
+    -- as a restore if the write actually took. An earlier version incremented
+    -- this counter whenever the call did not error, which produced hundreds of
+    -- "restored" reports while health kept dropping.
+    local ok, detail = game.set_health(baseline)
+    if ok then
       restores = restores + 1
+      last_write_error = nil
       logger.throttled("health:restore", 300, "debug", "Health",
-                       string.format("Restored health %.1f -> %.1f", health.current, baseline))
+                       string.format("Restored health %.1f -> %.1f via %s",
+                                     health.current, baseline, tostring(detail)))
     else
+      write_failures = write_failures + 1
+      last_write_error = tostring(detail)
       logger.throttled("health:writefail", 600, "warn", "Health",
-                       "Detected damage but could not write health back.")
+                       "Could not restore health: " .. tostring(detail))
     end
   else
     -- Same or higher: accept it, so healing and pickups are not undone.
@@ -226,6 +247,8 @@ function M.reset()
   enabled = false
   baseline = nil
   restores = 0
+  write_failures = 0
+  last_write_error = nil
 end
 
 return M
