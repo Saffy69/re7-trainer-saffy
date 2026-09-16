@@ -259,18 +259,25 @@ function M.item_infos()
   return require("re7trainer.utils.type_helpers").to_array(raw)
 end
 
---- The category name of an app.Item, or nil.
+--- The category of an app.Item, as a name, or nil.
 --
--- The category lives on app.ItemData, reached through the item's _ItemData
--- field. It is the engine's own classification, not something derived from the
--- item's name or id — which is what makes it trustworthy enough to gate a
--- destructive operation on.
+-- WHY THIS IS SO DEFENSIVE
+-- ------------------------
+-- The first version read app.ItemData.Category and expected a string. In game
+-- it came back unreadable, and the hook logged "pass (category unreadable)" --
+-- so the gate refused everything, correctly, and the cheat did nothing.
+--
+-- A .NET enum field does not necessarily surface as a Lua string. It may arrive
+-- as a number, as a userdata, or as a boxed value object, and which one it is
+-- cannot be determined without observing it. Rather than guess a third time,
+-- every plausible shape is attempted and the result is reported honestly.
 --
 -- @param item userdata app.Item
--- @return string|nil
+-- @return string|nil category_name
+-- @return string a short description of what was actually observed, for logging
 function M.item_category(item)
   if item == nil then
-    return nil
+    return nil, "no item"
   end
 
   local item_data = objects.call(item, "get_ItemData")
@@ -278,45 +285,84 @@ function M.item_category(item)
     item_data = objects.get(item, "_ItemData")
   end
   if item_data == nil then
-    return nil
+    return nil, "app.ItemData unreachable"
   end
 
-  -- The first enum member is the zero value and shares the enum's own name in
-  -- some layouts; treat anything non-string as unknown rather than guessing.
-  local category = objects.get(item_data, "Category")
-  if type(category) == "string" then
-    return category
+  local raw = objects.get(item_data, "Category")
+  if raw == nil then
+    return nil, "Category field unreadable"
   end
 
-  -- Enum values can surface as userdata; try to read a name off it.
-  local name = safe.try(category, "get_name") or safe.try(category, "ToString")
+  -- Shape 1: already a string.
+  if type(raw) == "string" then
+    return raw, "string"
+  end
+
+  -- Shape 2: a number. Named lookup is impossible without the enum's member
+  -- values, so the caller falls back to the stack-size test below.
+  local as_number = safe.to_number(raw)
+  if as_number ~= nil then
+    return nil, "numeric enum value " .. tostring(as_number)
+  end
+
+  -- Shape 3: a boxed value with a name accessor.
+  local name = safe.try(raw, "get_name") or safe.try(raw, "ToString")
   if type(name) == "string" then
-    return name
+    return name, "boxed"
   end
 
-  return nil
+  return nil, "unrecognised shape: " .. type(raw)
 end
 
 --- Is this item safe for the trainer to conserve?
 --
--- Fails CLOSED: an item whose category cannot be read is not safe. That is the
--- whole point -- an unreadable category is exactly the case where a guess
--- could touch a key item.
+-- Two independent gates, in order of confidence:
+--
+--   1. The engine's own category enum, when it can be read as a name. This is
+--      the precise answer and is preferred whenever available.
+--
+--   2. Stackability, as a fallback. An item whose MaxStackNum is greater than 1
+--      is by definition a stackable consumable; a key item does not stack. This
+--      is not a guess about item names -- it is a different engine-provided fact
+--      that happens to divide the same way, and it is why the cheat can still
+--      be gated honestly when the enum cannot be read.
+--
+-- Fails CLOSED: if neither gate can be evaluated, the item is not safe.
 --
 -- @param item userdata app.Item
 -- @return boolean safe, string reason
 function M.is_safe_to_conserve(item)
-  local category = M.item_category(item)
-
-  if category == nil then
-    return false, "category unreadable"
+  if item == nil then
+    return false, "no item"
   end
 
-  if M.SAFE_CATEGORIES[category] then
-    return true, category
+  local category, observation = M.item_category(item)
+
+  if category ~= nil then
+    if M.SAFE_CATEGORIES[category] then
+      return true, category
+    end
+    return false, "category '" .. category .. "' is not conservable"
   end
 
-  return false, "category '" .. category .. "' is not conservable"
+  -- Category unreadable. Fall back to stackability.
+  local max_stack = safe.to_number(objects.call(item, "getMaxStackNum"))
+  if max_stack == nil then
+    local item_data = objects.call(item, "get_ItemData") or objects.get(item, "_ItemData")
+    if item_data ~= nil then
+      max_stack = safe.to_number(objects.get(item_data, "MaxStackNum"))
+    end
+  end
+
+  if max_stack == nil then
+    return false, "category unreadable (" .. observation .. ") and stack size unknown"
+  end
+
+  if max_stack > 1 then
+    return true, "stackable (max " .. tostring(max_stack) .. "); category unreadable: " .. observation
+  end
+
+  return false, "does not stack (max " .. tostring(max_stack) .. ") -- treating as a key item"
 end
 
 --- How many items are currently classified as safe to conserve.

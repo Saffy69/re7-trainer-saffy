@@ -292,7 +292,65 @@ local function fake_inventory()
       return nil
     end,
     call = function(_, method)
-      if method == "get_ItemList" then return {} end
+      if method == "get_ItemList" then
+        -- One conservable item, so the inventory cheat's enable-time check has
+        -- something to approve. Without it the cheat correctly refuses, which
+        -- is right in game but leaves the hook path untested here.
+        return {
+          {
+            get_type_definition = function()
+              return { get_full_name = function() return "app.Inventory.ItemInfo" end }
+            end,
+            get_field = function(_, f)
+              if f == "Item" then
+                return {
+                  get_type_definition = function()
+                    return TYPE_DB["app.Item"]
+                  end,
+                  get_field = function(_, n)
+                    if n == "ItemDataID" then return "TestHerb" end
+                    if n == "_ItemData" then
+                      return {
+                        get_type_definition = function()
+                          return TYPE_DB["app.ItemData"]
+                        end,
+                        get_field = function(_, m)
+                          if m == "Category" then return "Drug" end
+                          if m == "MaxStackNum" then return 3 end
+                          return nil
+                        end,
+                        call = function() return nil end,
+                      }
+                    end
+                    return nil
+                  end,
+                  call = function(_, m)
+                    if m == "get_ItemData" then
+                      return {
+                        get_type_definition = function()
+                          return TYPE_DB["app.ItemData"]
+                        end,
+                        get_field = function(_, n)
+                          if n == "Category" then return "Drug" end
+                          if n == "MaxStackNum" then return 3 end
+                          return nil
+                        end,
+                        call = function() return nil end,
+                      }
+                    end
+                    if m == "getStackNum" then return 3 end
+                    if m == "getMaxStackNum" then return 3 end
+                    if m == "setStackNum" then return true end
+                    return nil
+                  end,
+                }
+              end
+              return nil
+            end,
+            call = function() return nil end,
+          },
+        }
+      end
       return nil
     end,
   }

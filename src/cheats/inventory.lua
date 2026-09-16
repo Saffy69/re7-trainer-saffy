@@ -74,6 +74,8 @@ function M.initialize()
     return
   end
 
+  -- Type-level check only. See the note in cheats/health.lua: initialize() runs
+  -- at script load, in the main menu, where there is no inventory to read.
   if safe.type_definition("app.ItemData") == nil then
     state.mark_unsupported("inventory",
       "app.ItemData missing, so item categories cannot be read safely")
@@ -82,7 +84,7 @@ function M.initialize()
   end
 
   state.mark_supported("inventory",
-    "item categories are readable, so consumables can be told from key items")
+    "item classification is available (validated against live items at enable time)")
   logger.info("Inventory", "Ready. Guarding destroyItem and restoring stack counts.")
 end
 
@@ -100,6 +102,28 @@ function M.status()
     return "ready (off)"
   end
   return string.format("active (%d blocked, %d restored)", blocks, restores)
+end
+
+--- Count how many carried items the gate currently considers conservable.
+--
+-- Used at enable time as a live sanity check: if nothing in the inventory is
+-- conservable, enabling is pointless and the reason should say so rather than
+-- leaving a toggle that appears on and does nothing.
+-- @return number conservable, number total
+local function count_conservable()
+  local conservable, total = 0, 0
+
+  for _, info in ipairs(game.item_infos()) do
+    local item = objects.get(info, "Item")
+    if item ~= nil then
+      total = total + 1
+      if game.is_safe_to_conserve(item) then
+        conservable = conservable + 1
+      end
+    end
+  end
+
+  return conservable, total
 end
 
 --- The destroyItem hook.
@@ -152,6 +176,27 @@ function M.enable()
     return false, reason
   end
 
+  -- Live check. If the inventory cannot be read, or nothing in it is
+  -- conservable, say so instead of leaving a toggle that appears on and does
+  -- nothing.
+  local conservable, total = count_conservable()
+
+  if total == 0 then
+    local reason = "no inventory readable yet -- load into gameplay and try again"
+    state.runtime.inventory_reason = reason
+    logger.warn("Inventory", "Cannot enable: " .. reason)
+    return false, reason
+  end
+
+  if conservable == 0 then
+    local reason = string.format(
+      "none of the %d carried items can be classified as a consumable, so nothing would be conserved",
+      total)
+    state.runtime.inventory_reason = reason
+    logger.warn("Inventory", "Cannot enable: " .. reason)
+    return false, reason
+  end
+
   local ok, detail = ensure_hook()
   if not ok then
     logger.error("Inventory", "Could not hook destroyItem: " .. tostring(detail))
@@ -159,8 +204,12 @@ function M.enable()
   end
 
   enabled = true
+  state.runtime.inventory_reason =
+    string.format("%d of %d carried items are conservable", conservable, total)
+
   M.refresh_baseline()
-  logger.info("Inventory", "Enabled. Drug/Material/Shell items will not be consumed.")
+  logger.info("Inventory", "Enabled. "
+    .. string.format("%d of %d carried items will be conserved.", conservable, total))
   return true, nil
 end
 

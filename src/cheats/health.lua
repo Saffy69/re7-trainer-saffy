@@ -50,6 +50,7 @@
 
 local logger = require("re7trainer.logger")
 local state = require("re7trainer.state")
+local safe = require("re7trainer.utils.safe_call")
 local game = require("re7trainer.game")
 
 local M = {}
@@ -74,22 +75,29 @@ function M.initialize()
   baseline = nil
   restores = 0
 
-  -- Confirm both halves of the mechanism exist before claiming support. A
-  -- cheat that can read but not write is not a cheat, and it should say so
-  -- rather than appear available.
-  if game.health() == nil then
-    state.mark_unsupported("health", "player health is not readable")
-    logger.warn("Health", "Cannot read health; Infinite Health will stay disabled.")
+  -- TYPE-LEVEL CHECK ONLY.
+  --
+  -- An earlier version also required a live player object here, and that was a
+  -- bug with a nasty shape: initialize() runs at script load, which is the main
+  -- menu, where no player exists. The subsystem was marked unsupported once and
+  -- never reconsidered, so the toggle stayed dead for the entire session even
+  -- though the player object appeared the moment a save was loaded.
+  --
+  -- Whether the player can be reached RIGHT NOW is a question for enable() and
+  -- update(); whether the mechanism exists at all is a question for startup.
+  if safe.type_definition("app.DamageController") == nil then
+    state.mark_unsupported("health", "app.DamageController is not present in this build")
+    logger.warn("Health", "Target type missing; Infinite Health will stay disabled.")
     return
   end
 
-  if game.health_info() == nil then
-    state.mark_unsupported("health", "app.HealthInfo is not reachable, so health cannot be written")
-    logger.warn("Health", "Cannot reach the writable health record; Infinite Health will stay disabled.")
+  if safe.type_definition("app.HealthInfo") == nil then
+    state.mark_unsupported("health", "app.HealthInfo is not present in this build")
+    logger.warn("Health", "Writable health record missing; Infinite Health will stay disabled.")
     return
   end
 
-  state.mark_supported("health", "health is both readable and writable")
+  state.mark_supported("health", "health is readable and writable (checked at enable time)")
   logger.info("Health", "Ready. Restoring health when it decreases.")
 end
 
@@ -106,6 +114,9 @@ function M.status()
   if not enabled then
     return "ready (off)"
   end
+  if state.runtime.health_current == nil then
+    return "enabled, waiting for the player object"
+  end
   return "active (" .. tostring(restores) .. " restored)"
 end
 
@@ -117,13 +128,30 @@ function M.enable()
     return false, reason
   end
 
-  -- Seed the baseline from the current value so the first frame after enabling
-  -- does not mistake a stale baseline for damage.
+  -- Live check, performed at the moment the user asks. This is where a missing
+  -- player object legitimately blocks things -- and the message says so, rather
+  -- than the toggle silently doing nothing.
   local health = game.health()
-  baseline = health and health.current or nil
-  enabled = true
+  if health == nil then
+    local reason = "no player object yet -- load into gameplay and try again"
+    state.runtime.health_reason = reason
+    logger.warn("Health", "Cannot enable: " .. reason)
+    return false, reason
+  end
 
-  logger.info("Health", "Enabled. Health will be restored whenever it drops.")
+  if game.health_info() == nil then
+    local reason = "the writable health record is not reachable right now"
+    state.runtime.health_reason = reason
+    logger.warn("Health", "Cannot enable: " .. reason)
+    return false, reason
+  end
+
+  baseline = health.current
+  enabled = true
+  state.runtime.health_reason = "health is readable and writable"
+
+  logger.info("Health", string.format("Enabled at %.1f. Health will be restored whenever it drops.",
+                                      baseline))
   return true, nil
 end
 
@@ -143,10 +171,14 @@ function M.update()
 
   local health = game.health()
   if health == nil then
-    -- Player object not available (menu, load, transition). Forget the
-    -- baseline rather than carrying a value across a boundary where it is
-    -- meaningless.
+    -- Player object not available (main menu, load, scene transition). Forget
+    -- the baseline rather than carrying a value across a boundary where it is
+    -- meaningless, and say so in the status line.
     baseline = nil
+    state.runtime.health_current = nil
+    if enabled then
+      state.runtime.health_reason = "waiting for the player object (menu or loading?)"
+    end
     return
   end
 
