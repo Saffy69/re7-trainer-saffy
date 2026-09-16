@@ -161,6 +161,13 @@ local function draw_game_access()
   local status = game.player_status()
   W.field("  PlayerStatus", status ~= nil and "reached" or "NOT reached")
 
+  -- The health WRITE depends on reaching the damage controller, which is a
+  -- different hop from reading health. Showing both separately is what makes
+  -- "health reads but will not write" diagnosable at a glance.
+  local controller = game.damage_controller()
+  W.field("  DamageController", controller ~= nil and "reached" or "NOT reached")
+  W.field("  HealthInfo", game.health_info() ~= nil and "reached" or "NOT reached")
+
   local health = game.health()
   if health ~= nil then
     W.field("  health", string.format("%.1f / %s",
@@ -304,9 +311,13 @@ local function draw_item_classification()
   W.text("Item classification")
   W.muted("the gate that decides what may be conserved")
 
-  local infos = game.item_infos()
+  local infos, route = game.item_infos()
+
+  W.field("  item list route", tostring(route))
+
   if #infos == 0 then
-    W.text("  no items readable (main menu, or inventory not reachable)")
+    W.text("  no items readable")
+    W.muted("the route line above says which accessors were tried and what they returned")
     return
   end
 

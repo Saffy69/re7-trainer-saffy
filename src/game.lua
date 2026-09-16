@@ -181,28 +181,90 @@ function M.health_info()
   return info
 end
 
---- Write the player's health directly.
+--- Write the player's health, and VERIFY the write actually took.
 --
--- app.HealthInfo carries a plain writable `Health` float and a set_health(float)
--- accessor, both confirmed present in the discovery dump. This exists because
--- hooking the damage path proved unreliable in practice, while reading and
--- writing the value does not.
+-- WHY THIS IS NOT A ONE-LINER
+-- ---------------------------
+-- The first version called app.HealthInfo:set_health(value) and checked only
+-- that the call did not error. In game it returned success every time while
+-- health kept dropping -- app.HealthInfo is a value type, so getHealthInfo()
+-- hands back a COPY, and writing to the copy is discarded. The cheat reported
+-- "restored" hundreds of times and changed nothing.
 --
--- @param value number
--- @return boolean ok
+-- A write that reports success and has no effect is worse than one that fails,
+-- because it looks like it is working. So every route below is followed by a
+-- re-read, and success means the number actually moved.
+--
+-- Routes, in order:
+--   1. app.DamageController.setHealth(value, maxHealth) -- on the real
+--      component object, not a struct copy. Two parameters, so the second is
+--      assumed to be the maximum; if that assumption is wrong the verify step
+--      catches it rather than silently corrupting anything.
+--   2. app.DamageController.adjustHealth(delta) -- add back what was lost.
+--   3. app.HealthInfo.set_health -- kept last, because it is the route already
+--      proven not to work; it costs nothing to leave as a final fallback.
+--
+-- @param value number  the health to restore to
+-- @return boolean ok, string detail
 function M.set_health(value)
+  local before = M.health()
+  if before == nil then
+    return false, "health unreadable before write"
+  end
+
+  local controller = M.damage_controller()
+  local maximum = before.max or value
+
+  --- Re-read and report whether the value actually moved.
+  local function verify(route)
+    local after = M.health()
+    if after == nil then
+      return false, route .. ": unreadable after write"
+    end
+    if math.abs(after.current - value) < 0.01 then
+      return true, route
+    end
+    return false, string.format("%s: no effect (%.1f -> %.1f, wanted %.1f)",
+                                route, before.current, after.current, value)
+  end
+
+  if controller ~= nil then
+    -- Route 1: the controller's own setter.
+    if safe.call_method(controller, "setHealth", value, maximum) then
+      local ok, detail = verify("setHealth")
+      if ok then
+        return true, detail
+      end
+    end
+
+    -- Route 2: adjust by the difference.
+    local delta = value - before.current
+    if delta ~= 0 and safe.call_method(controller, "adjustHealth", delta) then
+      local ok, detail = verify("adjustHealth")
+      if ok then
+        return true, detail
+      end
+    end
+  end
+
+  -- Route 3: the struct-copy route, kept only as a last resort.
   local info = M.health_info()
-  if info == nil then
-    return false
+  if info ~= nil then
+    if safe.call_method(info, "set_health", value) then
+      local ok, detail = verify("HealthInfo.set_health")
+      if ok then
+        return true, detail
+      end
+    end
+    if objects.set(info, "Health", value) then
+      local ok, detail = verify("HealthInfo.Health field")
+      if ok then
+        return true, detail
+      end
+    end
   end
 
-  local ok, result = safe.call_method(info, "set_health", value)
-  if ok and result ~= nil then
-    return true
-  end
-
-  -- Fall back to writing the field directly.
-  return objects.set(info, "Health", value)
+  return false, "no health write route had any effect"
 end
 
 --- Is the player dead, according to the game?
@@ -248,15 +310,41 @@ M.SAFE_CATEGORIES = {
 }
 
 --- The carried items, as a plain Lua array of app.Inventory.ItemInfo.
+--
+-- Two accessors are tried, because the first one returned nothing in game even
+-- though the destroyItem hook was demonstrably receiving real items: so items
+-- existed and were reachable, but get_ItemList() was not the way to enumerate
+-- them. _ItemList is the backing field the same method reads from.
+--
 -- @return table array (possibly empty)
+-- @return string which route produced the result, for diagnostics
 function M.item_infos()
   local inventory = M.inventory()
   if inventory == nil then
-    return {}
+    return {}, "no inventory"
   end
 
-  local raw = objects.call(inventory, "get_ItemList")
-  return require("re7trainer.utils.type_helpers").to_array(raw)
+  local type_helpers = require("re7trainer.utils.type_helpers")
+
+  -- Route A: the public accessor.
+  local via_method = type_helpers.to_array(objects.call(inventory, "get_ItemList"))
+  if #via_method > 0 then
+    return via_method, "get_ItemList()"
+  end
+
+  -- Route B: the backing field.
+  local via_field = type_helpers.to_array(objects.get(inventory, "_ItemList"))
+  if #via_field > 0 then
+    return via_field, "_ItemList field"
+  end
+
+  -- Neither produced anything. Report which shapes were seen so the next step
+  -- is a readout rather than another guess.
+  local raw_method = objects.call(inventory, "get_ItemList")
+  local raw_field = objects.get(inventory, "_ItemList")
+
+  return {}, string.format("both empty (get_ItemList=%s, _ItemList=%s)",
+                           type(raw_method), type(raw_field))
 end
 
 --- The category of an app.Item, as a name, or nil.
@@ -430,24 +518,39 @@ function M.gun_ammo(gun)
   }
 end
 
---- Write a gun's magazine count.
+--- Write a gun's magazine count, and VERIFY the write took.
 --
--- set_loadNum is the method the game itself calls to change the magazine.
--- Confirmed in game: emptying a magazine and reloading produced six
--- set_loadNum calls. Note that expendBullet, which the first implementation
--- hooked, never fired at all -- it is not on the firing path in this build.
+-- set_loadNum is the method the game itself calls to change the magazine --
+-- confirmed in game, six calls while emptying a magazine and reloading. But a
+-- call that reports success is not evidence the value changed, which is exactly
+-- how the health write failed. So this re-reads and reports what happened.
 --
 -- @param value number
 -- @param gun userdata|nil defaults to the equipped gun
--- @return boolean ok
+-- @return boolean ok, string detail
 function M.set_magazine(value, gun)
   gun = gun or M.equipped_gun()
   if gun == nil then
-    return false
+    return false, "no gun"
   end
 
-  local ok, result = safe.call_method(gun, "set_loadNum", value)
-  return ok and result ~= nil
+  if not safe.call_method(gun, "set_loadNum", value) then
+    return false, "set_loadNum call failed"
+  end
+
+  local after = safe.to_number(objects.call(gun, "get_loadNum"))
+  if after == nil then
+    return false, "unreadable after write"
+  end
+
+  if math.abs(after - value) < 0.5 then
+    return true, "set_loadNum"
+  end
+
+  -- The call was accepted and did nothing. Say so rather than reporting a
+  -- restore that never happened.
+  return false, string.format("set_loadNum had no effect (%.0f -> %.0f, wanted %.0f)",
+                              value, after, value)
 end
 
 --- Write an item's stack count.
