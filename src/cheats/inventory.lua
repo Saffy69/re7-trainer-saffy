@@ -131,16 +131,17 @@ end
 -- @param args table
 local function on_reduce_num(args)
   -- Runs on the game thread holding the Lua lock, so the cheapest possible
-  -- early-outs come first.
-  if not enabled then
-    return sdk.PreHookResult.CALL_ORIGINAL
-  end
-  if state.prefs.trainer_enabled ~= true then
+  -- early-outs come first. The counter records every call, including the ones
+  -- that pass through, so "reduceNum is not the consumption path" can be told
+  -- apart from "the hook is gating wrong".
+  if not enabled or state.prefs.trainer_enabled ~= true then
+    safe.note_invocation(HOOK_KEY, "pass (disabled)")
     return sdk.PreHookResult.CALL_ORIGINAL
   end
 
   local item = safe.to_managed_object(args[2])
   if item == nil then
+    safe.note_invocation(HOOK_KEY, "pass (no item)")
     return sdk.PreHookResult.CALL_ORIGINAL
   end
 
@@ -153,10 +154,12 @@ local function on_reduce_num(args)
     -- unclassified would otherwise flood the log.
     logger.throttled("inv:skip:" .. tostring(reason), 600, "debug", "Inventory",
                      "Not conserving: " .. tostring(reason))
+    safe.note_invocation(HOOK_KEY, "pass (" .. tostring(reason) .. ")")
     return sdk.PreHookResult.CALL_ORIGINAL
   end
 
   suppressed = suppressed + 1
+  safe.note_invocation(HOOK_KEY, "SKIP (" .. tostring(reason) .. ")")
   return sdk.PreHookResult.SKIP_ORIGINAL
 end
 

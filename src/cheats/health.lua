@@ -114,12 +114,14 @@ local function ensure_hook()
     "doDamage",
     function(args)
       -- Runs on the game thread while holding the Lua lock. Keep it minimal.
-      if not enabled then
+      -- The counter is the whole point of this being instrumented: if it stays
+      -- at zero while you are being hit, doDamage is not the method the game
+      -- calls to damage the player, and no amount of hooking it will help.
+      if not enabled or state.prefs.trainer_enabled ~= true then
+        safe.note_invocation(HOOK_KEY, "pass (disabled)")
         return sdk.PreHookResult.CALL_ORIGINAL
       end
-      if state.prefs.trainer_enabled ~= true then
-        return sdk.PreHookResult.CALL_ORIGINAL
-      end
+      safe.note_invocation(HOOK_KEY, "SKIP")
       return sdk.PreHookResult.SKIP_ORIGINAL
     end,
     nil
