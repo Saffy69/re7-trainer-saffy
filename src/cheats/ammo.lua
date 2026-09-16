@@ -37,6 +37,7 @@
 local logger = require("re7trainer.logger")
 local state = require("re7trainer.state")
 local safe = require("re7trainer.utils.safe_call")
+local objects = require("re7trainer.utils.object_helpers")
 local game = require("re7trainer.game")
 
 local M = {}
@@ -51,6 +52,10 @@ local baseline = nil
 
 --- Number of rounds restored, for the debug panel.
 local restores = 0
+
+--- Whether the game's own infinity flag is doing the work (preferred), rather
+--- than the per-frame restore fallback.
+local using_infinity_flag = false
 
 --- Write attempts that did not change the value, and the last reason.
 -- Kept separate from restores so the panel can tell a working cheat from one
@@ -97,11 +102,15 @@ function M.status()
     return "enabled, waiting for a weapon"
   end
 
+  if using_infinity_flag then
+    return string.format("active (unlimited magazine, %d in the gun)", state.runtime.ammo_current)
+  end
+
   if write_failures > 0 and restores == 0 then
     return "NOT WORKING -- " .. tostring(last_write_error or "writes have no effect")
   end
 
-  return string.format("active (%d restored, %d failed)", restores, write_failures)
+  return string.format("active (restoring, %d restored, %d failed)", restores, write_failures)
 end
 
 --- @return boolean ok, string message
@@ -121,15 +130,31 @@ function M.enable()
     return false, reason
   end
 
+  -- Primary mechanism: the game's OWN unlimited-magazine flag.
+  --
+  -- app.WeaponGunParameter.IsLoadNumInfinity is a writable boolean that the
+  -- game itself consults, exposed publicly via WeaponGun.get_isLoadNumInfinity().
+  -- Setting it means the count is never decremented and never wrong -- not even
+  -- for one frame -- and nothing is written per shot. This is the "prevent at
+  -- source" strategy the project asked for, achieved with a first-class game
+  -- feature rather than by intercepting code.
+  local flag_ok, flag_detail = game.set_infinite_magazine(true)
+
   baseline = ammo.magazine
   enabled = true
-  state.runtime.ammo_reason = "magazine is readable and writable"
+  using_infinity_flag = flag_ok
 
-  if baseline == 0 then
-    logger.warn("Ammo", "Enabled while the magazine is empty, so there is nothing to preserve. "
-                     .. "Reload once and the cheat will hold the count from then on.")
+  if flag_ok then
+    state.runtime.ammo_reason = "unlimited magazine via " .. tostring(flag_detail)
+    logger.info("Ammo", "Enabled using the game's own IsLoadNumInfinity flag (" ..
+                        tostring(flag_detail) .. ").")
   else
-    logger.info("Ammo", string.format("Enabled at %d round(s). Firing will not consume them.", baseline))
+    -- Fall back to restoring the value when it drops. Works, but can show the
+    -- decremented number for up to a frame.
+    state.runtime.ammo_reason = "restoring the magazine count (infinity flag unavailable: "
+                                .. tostring(flag_detail) .. ")"
+    logger.warn("Ammo", "Infinity flag unavailable (" .. tostring(flag_detail) ..
+                        "); falling back to restoring the count each frame.")
   end
 
   return true, nil
@@ -138,10 +163,25 @@ end
 function M.disable()
   enabled = false
   baseline = nil
+
+  -- Clear the game's flag if we were the ones who set it. Leaving it on would
+  -- make the cheat keep working after being switched off.
+  if using_infinity_flag then
+    local ok, detail = game.set_infinite_magazine(false)
+    if not ok then
+      logger.warn("Ammo", "Could not clear IsLoadNumInfinity: " .. tostring(detail))
+    end
+    using_infinity_flag = false
+  end
+
   logger.info("Ammo", "Disabled. Normal ammo consumption restored.")
 end
 
 --- Per-frame work.
+--
+-- Does almost nothing when the infinity flag is carrying the cheat: there is no
+-- value to watch, because the game never decrements it. The restore path only
+-- runs when the flag was unavailable and this is working the hard way.
 function M.update()
   if not M.is_supported() then
     return
@@ -149,8 +189,6 @@ function M.update()
 
   local ammo = game.gun_ammo()
   if ammo == nil then
-    -- Weapon swapped, holstered, or a scene change. Drop the baseline rather
-    -- than carrying a count from a different gun onto this one.
     baseline = nil
     state.runtime.ammo_current = nil
     if enabled then
@@ -163,6 +201,16 @@ function M.update()
 
   if not enabled or state.prefs.trainer_enabled ~= true then
     baseline = ammo.magazine
+    return
+  end
+
+  if using_infinity_flag then
+    -- Nothing to do. Confirm the flag is still set -- the game may clear it on
+    -- a weapon swap -- and re-apply if so.
+    local param = game.gun_parameter()
+    if param ~= nil and objects.get(param, "IsLoadNumInfinity") ~= true then
+      game.set_infinite_magazine(true)
+    end
     return
   end
 
