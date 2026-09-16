@@ -404,6 +404,66 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+-- Container conversion
+--
+-- Locks in the behaviour of type_helpers.to_array, which is the single point
+-- where the sol2 container shape is handled. This is the code that silently
+-- produced "0 methods for every type in the game" when it assumed a plain Lua
+-- table, so it gets explicit case coverage rather than being trusted.
+-- ---------------------------------------------------------------------------
+
+io.write("\ncontainer conversion\n")
+do
+  local type_helpers = require("re7trainer.utils.type_helpers")
+  local to_array = type_helpers.to_array
+
+  check("to_array is exported for testing", type(to_array) == "function")
+
+  if type(to_array) == "function" then
+    local plain = to_array({ "a", "b", "c" })
+    check("plain array", #plain == 3 and plain[1] == "a" and plain[3] == "c",
+          string.format("got %d", #plain))
+
+    -- Zero-indexed container that declares its size. ipairs alone yields a
+    -- short list here, which is the failure mode being guarded against.
+    local sized = setmetatable({}, {
+      __index = function(_, k)
+        if k == "size" then return function() return 3 end end
+        if type(k) == "number" and k >= 0 and k <= 2 then return "s" .. k end
+        return nil
+      end,
+    })
+    check("zero-indexed with size() reads all elements", #to_array(sized) == 3,
+          string.format("got %d", #to_array(sized)))
+
+    -- Degenerate inputs must yield nothing rather than throwing.
+    check("nil yields empty", #to_array(nil) == 0)
+    check("scalar yields empty", #to_array(42) == 0 and #to_array("x") == 0)
+
+    -- A real userdata that is not a container must not throw.
+    local handle = io.open("/dev/null", "r")
+    if handle then
+      local ok = pcall(to_array, handle)
+      check("foreign userdata does not throw", ok)
+      handle:close()
+    end
+
+    -- A container whose size() raises must fall through to another strategy.
+    local throwing = setmetatable({}, {
+      __index = function(_, k)
+        if k == "size" then return function() error("boom") end end
+        if type(k) == "number" and k == 1 then return "safe" end
+        return nil
+      end,
+      __len = function() return 1 end,
+    })
+    local recovered = to_array(throwing)
+    check("size() raising falls through", #recovered == 1 and recovered[1] == "safe",
+          string.format("got %d", #recovered))
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Report
 -- ---------------------------------------------------------------------------
 
