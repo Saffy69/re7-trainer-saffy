@@ -317,6 +317,25 @@ end
 --- Keys of hooks already installed, so they are never installed twice.
 local installed = {}
 
+--- Per-hook invocation counters, keyed the same way.
+--
+-- WHY THIS EXISTS. "The cheat does nothing" has two completely different
+-- causes that look identical from the outside:
+--
+--   (a) the hook was never installed -- get_method returned nil, or sdk.hook
+--       threw, or the cheat was never actually enabled
+--   (b) the hook installed fine but the game never calls that method, so the
+--       callback never runs
+--
+-- Guessing between them wastes a round trip. A counter settles it: zero
+-- invocations while the player is being shot means the target is wrong, not
+-- the hook. Anything else means the target is right and the decision inside
+-- the callback is the problem.
+local invocations = {}
+
+--- Last decision a pre-callback returned, per hook key. Diagnostic only.
+local last_decision = {}
+
 --- Install a hook on a method, at most once.
 --
 -- The pre-callback receives a 1-indexed table of raw void*:
@@ -368,9 +387,52 @@ function M.hook_method(key, type_name, method_name, pre, post)
     return false, tostring(hook_id)
   end
 
-  installed[key] = hook_id
+  installed[key] = true
+  invocations[key] = 0
   logger.info("Hook", "Installed on " .. type_name .. "." .. method_name)
   return true, nil
+end
+
+--- Record that a hook's pre-callback fired, and what it decided.
+--
+-- Called by the cheat callbacks themselves rather than by a wrapper, because
+-- wrapping would hide the real callback from the selfcheck and would add a
+-- closure layer inside a function that runs on the game thread.
+-- @param key string
+-- @param decision any the value the callback returned
+function M.note_invocation(key, decision)
+  invocations[key] = (invocations[key] or 0) + 1
+  last_decision[key] = tostring(decision)
+end
+
+--- How many times a hook's callback has run.
+-- @param key string
+-- @return number
+function M.invocation_count(key)
+  return invocations[key] or 0
+end
+
+--- The last decision value a hook's callback returned, as a string.
+-- @param key string
+-- @return string|nil
+function M.last_decision(key)
+  return last_decision[key]
+end
+
+--- Summary of every hook, for the debug panel.
+-- @return table array of { key, installed, invocations, last_decision }
+function M.hook_report()
+  local report = {}
+  for key in pairs(installed) do
+    report[#report + 1] = {
+      key = key,
+      installed = true,
+      invocations = invocations[key] or 0,
+      last_decision = last_decision[key],
+    }
+  end
+  table.sort(report, function(a, b) return a.key < b.key end)
+  return report
 end
 
 --- Has a hook already been installed for this key?

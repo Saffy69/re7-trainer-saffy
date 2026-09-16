@@ -195,6 +195,93 @@ local function draw_game_access()
   W.field("  hooks installed", tostring(safe.hook_count()))
 end
 
+--- Draw hook state.
+--
+-- This is the block that answers "the cheat does nothing" definitively. The
+-- two causes look identical from outside and need completely different fixes:
+--
+--   invocations == 0 while the action is happening
+--       -> the game does not call this method for that action. The target is
+--          wrong; hooking harder will not help.
+--   invocations climbing but behaviour unchanged, last decision "SKIP"
+--       -> the right method is being intercepted and the game is changing the
+--          value somewhere else anyway.
+--   last decision showing "pass (...)"
+--       -> the hook is running and deliberately declining; the reason is shown.
+local function draw_hooks()
+  local W_ = W
+  W_.spacing()
+  W_.text("Hooks and toggles")
+
+  -- Whether the toggle actually engaged. A cheat that was never turned on
+  -- cannot do anything, and that is worth ruling out first.
+  W_.field("  trainer enabled", tostring(state.prefs.trainer_enabled))
+  W_.field("  god_mode", tostring(state.prefs.god_mode))
+  W_.field("  infinite_ammo", tostring(state.prefs.infinite_ammo))
+  W_.field("  infinite_items", tostring(state.prefs.infinite_items))
+
+  local report = safe.hook_report()
+  if #report == 0 then
+    W_.text("  no hooks installed yet -- enable a cheat once")
+    return
+  end
+
+  for _, entry in ipairs(report) do
+    W_.field("  " .. entry.key,
+             string.format("calls=%d  last=%s",
+                           entry.invocations,
+                           entry.last_decision or "-"))
+  end
+end
+
+--- Draw the method-call probe.
+--
+-- Workflow: press "Watch method calls", press "Mark" immediately before doing
+-- the thing, do the thing, then read the list. Only methods that fired between
+-- the mark and now are listed, so the answer is a delta rather than a raw
+-- counter that has been accumulating since load.
+local last_snapshot = nil
+local last_fired = nil
+
+local function draw_hook_probe()
+  local probe = require("re7trainer.discovery.hook_probe")
+
+  W.spacing()
+  W.text("Method-call probe")
+  W.muted("finds which methods the game actually calls when you act")
+
+  W.field("  watching", tostring(probe.watching_count()) .. " method(s)")
+
+  if W.button("Watch method calls") then
+    probe.install()
+    W.text("  installed -- now Mark, then act")
+  end
+
+  if W.button("Mark (do this BEFORE the action)") then
+    last_snapshot = probe.snapshot()
+    last_fired = nil
+    W.text("  marked")
+  end
+
+  if W.button("Report (do this AFTER the action)") then
+    if last_snapshot == nil then
+      W.text("  press Mark first")
+    else
+      last_fired = probe.diff(last_snapshot, probe.snapshot())
+    end
+  end
+
+  if last_fired ~= nil then
+    if #last_fired == 0 then
+      W.text("  nothing fired -- none of the watched methods ran")
+    else
+      for _, entry in ipairs(last_fired) do
+        W.field("  FIRED", entry.key .. "  x" .. tostring(entry.delta))
+      end
+    end
+  end
+end
+
 --- Draw the whole debug panel.
 function M.draw()
   if not W.available() then
@@ -205,6 +292,8 @@ function M.draw()
   draw_discovery_state()
   draw_live_values()
   draw_game_access()
+  draw_hooks()
+  draw_hook_probe()
   draw_candidates()
   draw_controls()
 end
