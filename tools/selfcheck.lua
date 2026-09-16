@@ -156,12 +156,27 @@ TYPE_DB["app.PlayerDamageController"] = make_type("app.PlayerDamageController", 
 -- Types the implemented cheats hook. Present so the selfcheck exercises the
 -- real enable/disable paths rather than skipping them.
 TYPE_DB["app.Item"] = make_type("app.Item", nil,
-  { make_method("reduceNum", "System.Boolean", { "System.Int32", "System.Boolean" }),
+  { make_method("destroyItem", "System.Void", {}),
+    make_method("reduceNum", "System.Boolean", { "System.Int32", "System.Boolean" }),
     make_method("useItem", "System.Boolean", { "System.Int32" }),
     make_method("getStackNum", "System.Int32", {}),
+    make_method("setStackNum", "System.Void", { "System.Int32" }),
     make_method("get_ItemData", "app.ItemData", {}) },
   { make_field("ItemStackNum", "System.Int32"),
+    make_field("ItemDataID", "System.String"),
     make_field("_ItemData", "app.ItemData") })
+
+TYPE_DB["app.HealthInfo"] = make_type("app.HealthInfo", nil,
+  { make_method("get_health", "System.Single", {}),
+    make_method("set_health", "System.Void", { "System.Single" }) },
+  { make_field("Health", "System.Single"),
+    make_field("MaxHealth", "System.Single") })
+
+TYPE_DB["app.DamageController"] = make_type("app.DamageController", nil,
+  { make_method("getHealthInfo", "app.HealthInfo", {}),
+    make_method("adjustHealth", "System.Void", { "System.Single" }),
+    make_method("addHitDamage", "app.DamageController.DamageRecord", { "System.Int32" }) },
+  { make_field("HealthInfo", "app.HealthInfo") })
 
 TYPE_DB["app.ItemData"] = make_type("app.ItemData", nil,
   { make_method("getSlotNum", "System.Int32", {}) },
@@ -200,6 +215,55 @@ local CONSTRUCTED_SINGLETONS = {}
 -- earlier version was a bare table and produced error-level log lines that
 -- looked like real faults.
 local function fake_inventory()
+  -- The writable health record. app.DamageController carries it as a field and
+  -- via getHealthInfo(); the health cheat needs BOTH the read and the write to
+  -- exist before it will claim support.
+  local health_info = {
+    get_type_definition = function()
+      return { get_full_name = function() return "app.HealthInfo" end }
+    end,
+    get_field = function(_, name)
+      if name == "Health" then return 100.0 end
+      return nil
+    end,
+    call = function(_, method)
+      if method == "get_health" then return 100.0 end
+      if method == "get_maxHealth" then return 100.0 end
+      if method == "set_health" then return true end
+      return nil
+    end,
+  }
+
+  local damage_controller = {
+    get_type_definition = function()
+      return TYPE_DB["app.PlayerDamageController"]
+    end,
+    get_field = function(_, name)
+      if name == "HealthInfo" then return health_info end
+      return nil
+    end,
+    call = function(_, method)
+      if method == "getHealthInfo" then return health_info end
+      return nil
+    end,
+  }
+
+  -- A stand-in for the equipped weapon. The ammo cheat needs a readable
+  -- magazine before it will claim support.
+  local gun = {
+    get_type_definition = function()
+      return TYPE_DB["app.WeaponGun"]
+    end,
+    get_field = function() return nil end,
+    call = function(_, method)
+      if method == "get_loadNum" then return 12 end
+      if method == "get_maxLoadNum" then return 15 end
+      if method == "get_bulletStackNum" then return 40 end
+      if method == "set_loadNum" then return true end
+      return nil
+    end,
+  }
+
   return {
     get_type_definition = function()
       return { get_full_name = function() return "app.Inventory" end }
@@ -210,7 +274,11 @@ local function fake_inventory()
           get_type_definition = function()
             return TYPE_DB["app.PlayerStatus"]
           end,
-          get_field = function() return nil end,
+          get_field = function(_, f)
+            if f == "PlayerDamageController" then return damage_controller end
+            if f == "PlayerGun" then return gun end
+            return nil
+          end,
           call = function(_, method)
             if method == "get_health" then return 100.0 end
             if method == "get_maxHealth" then return 100.0 end
@@ -592,14 +660,14 @@ do
   check("ammo enables", (ammo.enable()))
   check("inventory enables", (inventory.enable()))
 
-  check("three hooks installed", #HOOKS_INSTALLED == before + 3,
+  -- Only the inventory cheat hooks anything now. Health and ammo use
+  -- read-and-restore, because the probe established that the methods they
+  -- originally hooked are not on the paths that matter.
+  check("inventory installed its hook", #HOOKS_INSTALLED == before + 1,
         string.format("%d installed", #HOOKS_INSTALLED - before))
 
-  -- Re-enabling must NOT stack a second hook on the same method.
-  health.enable()
-  ammo.enable()
   inventory.enable()
-  check("re-enable does not stack hooks", #HOOKS_INSTALLED == before + 3,
+  check("re-enable does not stack hooks", #HOOKS_INSTALLED == before + 1,
         string.format("%d installed", #HOOKS_INSTALLED - before))
 
   -- Locate an installed hook by the method it was attached to. Matching on the
@@ -614,40 +682,16 @@ do
     return nil
   end
 
-  local dmg = hook_for("app.PlayerDamageController", "doDamage")
-  check("health hook is on doDamage", dmg ~= nil)
-  if dmg then
-    check("health pre skips while enabled",
-          dmg.pre({}) == sdk.PreHookResult.SKIP_ORIGINAL)
-    health.disable()
-    check("health pre calls through while disabled",
-          dmg.pre({}) == sdk.PreHookResult.CALL_ORIGINAL)
-    health.enable()
-  end
+  -- Health and ammo must not have installed any hook.
+  check("health installed no hook", hook_for("app.PlayerDamageController", "doDamage") == nil)
+  check("ammo installed no hook", hook_for("app.WeaponGun", "expendBullet") == nil)
 
-  local exp = hook_for("app.WeaponGun", "expendBullet")
-  check("ammo hook is on expendBullet", exp ~= nil)
-  if exp then
-    check("ammo pre skips while enabled",
-          exp.pre({}) == sdk.PreHookResult.SKIP_ORIGINAL)
-    ammo.disable()
-    check("ammo pre calls through while disabled",
-          exp.pre({}) == sdk.PreHookResult.CALL_ORIGINAL)
-    ammo.enable()
-  end
+  local destroy = hook_for("app.Item", "destroyItem")
+  check("inventory hook is on destroyItem", destroy ~= nil)
 
-  local red = hook_for("app.Item", "reduceNum")
-  check("inventory hook is on reduceNum", red ~= nil)
-
-  if red then
+  if destroy then
     -- A fake app.Item whose category we control. This is the safety-critical
     -- path: a key item MUST NOT be conserved even while the cheat is on.
-    --
-    -- The stub mirrors how REFramework exposes a managed object: fields are
-    -- read through get_field, not through plain Lua table indexing. An earlier
-    -- version of this fake was a bare table, and the production code correctly
-    -- refused to treat it as safe -- which is the fail-closed behaviour working
-    -- as designed, and worth keeping in mind when reading a failure here.
     local function fake_item_data(category)
       return {
         get_type_definition = function()
@@ -677,23 +721,23 @@ do
       }
     end
 
-    check("drug is conserved while enabled",
-          red.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.SKIP_ORIGINAL)
+    check("drug destruction is blocked while enabled",
+          destroy.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.SKIP_ORIGINAL)
 
-    check("KeyItem is NOT conserved while enabled",
-          red.pre({ [1] = nil, [2] = fake_item("KeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
-    check("UsableKeyItem is NOT conserved while enabled",
-          red.pre({ [1] = nil, [2] = fake_item("UsableKeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
-    check("Weapon is NOT conserved while enabled",
-          red.pre({ [1] = nil, [2] = fake_item("Weapon") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("KeyItem destruction is NOT blocked",
+          destroy.pre({ [1] = nil, [2] = fake_item("KeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("UsableKeyItem destruction is NOT blocked",
+          destroy.pre({ [1] = nil, [2] = fake_item("UsableKeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("Weapon destruction is NOT blocked",
+          destroy.pre({ [1] = nil, [2] = fake_item("Weapon") }) == sdk.PreHookResult.CALL_ORIGINAL)
 
     -- Fail closed: an unreadable category must not be treated as safe.
-    check("unreadable category is NOT conserved",
-          red.pre({ [1] = nil, [2] = fake_item(nil) }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("unreadable category is NOT blocked",
+          destroy.pre({ [1] = nil, [2] = fake_item(nil) }) == sdk.PreHookResult.CALL_ORIGINAL)
 
     inventory.disable()
-    check("nothing is conserved while disabled",
-          red.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("nothing is blocked while disabled",
+          destroy.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.CALL_ORIGINAL)
     inventory.enable()
   end
 end
