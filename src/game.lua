@@ -730,4 +730,86 @@ function M.item_stack(item)
   return safe.to_number(objects.get(item, "ItemStackNum"))
 end
 
+--- Read a managed System.String as a Lua string, or nil.
+--
+-- A hook parameter arriving as a managed string is not a Lua string -- it is a
+-- pointer to a managed object. REFramework may or may not surface its text
+-- through any given accessor, and which one works cannot be reasoned out, so
+-- every plausible route is tried and the caller is told which succeeded.
+--
+-- This matters because app.Inventory.reduceItem receives the item id as
+-- System.String in args[3]; without being able to read it, that call cannot be
+-- gated on which item is being consumed.
+--
+-- @param value any
+-- @return string|nil
+-- @return string how it was read, for diagnostics
+function M.read_managed_string(value)
+  if value == nil then
+    return nil, "nil"
+  end
+
+  if type(value) == "string" then
+    return value, "already a Lua string"
+  end
+
+  local object = safe.to_managed_object(value)
+  if object == nil then
+    return nil, "not a managed object (" .. type(value) .. ")"
+  end
+
+  --- Reject anything that is clearly a rendered pointer rather than text.
+  local function usable(text)
+    return type(text) == "string"
+       and #text > 0
+       and not text:find("userdata", 1, true)
+       and not text:match("^0x")
+  end
+
+  -- Route 1: REFramework's __tostring may already render the text.
+  local rendered = tostring(object)
+  if usable(rendered) then
+    return rendered, "tostring"
+  end
+
+  -- Route 2: ToString(), which for System.String returns itself.
+  local via_call = objects.call(object, "ToString")
+  if type(via_call) == "string" and usable(via_call) then
+    return via_call, "ToString"
+  end
+  if via_call ~= nil then
+    local second = tostring(via_call)
+    if usable(second) then
+      return second, "ToString then tostring"
+    end
+  end
+
+  return nil, "managed string could not be rendered"
+end
+
+--- Find a carried item by its data ID.
+--
+-- Turns an item id arriving as a hook parameter into a real app.Item, so its
+-- category can be checked before anything is decided.
+-- @param item_data_id string
+-- @return userdata|nil app.Item
+function M.find_item_by_id(item_data_id)
+  if type(item_data_id) ~= "string" or item_data_id == "" then
+    return nil
+  end
+
+  local infos = M.item_infos()
+  for _, info in ipairs(infos) do
+    local item = objects.get(info, "Item")
+    if item ~= nil then
+      local id = objects.get(item, "ItemDataID")
+      if id == item_data_id then
+        return item
+      end
+    end
+  end
+
+  return nil
+end
+
 return M

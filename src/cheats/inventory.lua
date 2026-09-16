@@ -138,32 +138,24 @@ local function count_conservable()
   return conservable, total
 end
 
---- The destroyItem hook.
+--- The destroyItem observer.
 --
--- args layout, from the verified sdk.hook signature:
---   args[1] = REThreadContext*, args[2] = `this` (the app.Item)
+-- COUNT-ONLY. IT DOES NOT BLOCK ANYTHING.
+--
+-- It used to, and that was wrong at two levels. In game it reported "2 blocked"
+-- while the items were consumed anyway -- so it is a lifecycle notification
+-- that runs once the item is already on its way out, not the removal itself.
+-- And it fires for combining and discarding as well as for use, so blocking it
+-- would have fought the player's own deliberate actions if it had worked.
+--
+-- The gate now lives on app.Inventory.reduceItem, which identifies the item and
+-- runs before the removal. This callback stays because its call count is still
+-- a useful signal in the panel.
+--
 -- @param args table
 local function on_destroy_item(args)
-  if not enabled or state.prefs.trainer_enabled ~= true then
-    safe.note_invocation(HOOK_KEY, "pass (disabled)")
-    return sdk.PreHookResult.CALL_ORIGINAL
-  end
-
-  local item = safe.to_managed_object(args[2])
-  if item == nil then
-    safe.note_invocation(HOOK_KEY, "pass (no item)")
-    return sdk.PreHookResult.CALL_ORIGINAL
-  end
-
-  local item_safe, reason = game.is_safe_to_conserve(item)
-  if not item_safe then
-    safe.note_invocation(HOOK_KEY, "pass (" .. tostring(reason) .. ")")
-    return sdk.PreHookResult.CALL_ORIGINAL
-  end
-
-  blocks = blocks + 1
-  safe.note_invocation(HOOK_KEY, "SKIP (destroy blocked)")
-  return sdk.PreHookResult.SKIP_ORIGINAL
+  safe.note_invocation(HOOK_KEY, enabled and "observed" or "observed (disabled)")
+  return sdk.PreHookResult.CALL_ORIGINAL
 end
 
 --- The reduceItem hook: the inventory-level decrement.
@@ -193,51 +185,46 @@ end
 --   args[3..] = parameters
 -- @param args table
 local function on_reduce_item(args)
+  -- NOTE: every note_invocation in this function must use HOOK_KEY_REDUCE.
+  -- An earlier version used HOOK_KEY throughout, so reduceItem's calls were
+  -- counted under destroyItem's row and the panel showed "reduceItem: calls=0"
+  -- while its arguments were clearly being recorded. Two hooks sharing one
+  -- counter made the diagnostics contradict themselves.
   if not enabled or state.prefs.trainer_enabled ~= true then
-    safe.note_invocation(HOOK_KEY, "pass (disabled)")
+    safe.note_invocation(HOOK_KEY_REDUCE, "pass (disabled)")
     return sdk.PreHookResult.CALL_ORIGINAL
   end
 
-  -- Examine each parameter. The first one that looks like an app.Item decides.
-  local examined = {}
+  -- The item id arrives as a managed System.String in the first parameter.
+  -- Reading it is what makes this call gatable at all: without it we know only
+  -- that *something* is being reduced, and blocking on that would block
+  -- combining, discarding and puzzle handovers along with real use.
+  local item_id, how_read = game.read_managed_string(args[3])
 
-  for i = 3, 5 do
-    local raw = args[i]
-    if raw ~= nil then
-      local as_object = safe.to_managed_object(raw)
-
-      if as_object ~= nil then
-        local type_name = objects.type_name(as_object) or "?"
-        examined[#examined + 1] = string.format("[%d]=%s", i, type_name)
-
-        if type_name == "app.Item" or type_name:find("Item", 1, true) then
-          local item_safe, reason = game.is_safe_to_conserve(as_object)
-
-          if item_safe then
-            blocks = blocks + 1
-            safe.note_invocation(HOOK_KEY, "SKIP (" .. tostring(reason) .. ")")
-            return sdk.PreHookResult.SKIP_ORIGINAL
-          end
-
-          -- A readable item that is not conservable: let it through, and say so.
-          safe.note_invocation(HOOK_KEY, "pass (" .. tostring(reason) .. ")")
-          return sdk.PreHookResult.CALL_ORIGINAL
-        end
-      else
-        -- Not a managed object -- record it as a plain value so the panel shows
-        -- what the parameters actually are.
-        local as_number = safe.to_number(raw)
-        examined[#examined + 1] = string.format("[%d]=%s", i,
-          as_number ~= nil and tostring(as_number) or type(raw))
-      end
-    end
+  if item_id == nil then
+    last_args = "[3] unreadable (" .. tostring(how_read) .. ")"
+    safe.note_invocation(HOOK_KEY_REDUCE, "pass (id unreadable)")
+    return sdk.PreHookResult.CALL_ORIGINAL
   end
 
-  last_args = table.concat(examined, " ")
+  local item = game.find_item_by_id(item_id)
 
-  -- Nothing identifiable. Pass through rather than risk blocking the wrong
-  -- thing.
-  safe.note_invocation(HOOK_KEY, "pass (unidentified args)")
+  if item == nil then
+    last_args = item_id .. " (not in inventory)"
+    safe.note_invocation(HOOK_KEY_REDUCE, "pass (item not found)")
+    return sdk.PreHookResult.CALL_ORIGINAL
+  end
+
+  local item_safe, reason = game.is_safe_to_conserve(item)
+  last_args = string.format("%s [%s] -> %s", item_id, tostring(how_read), tostring(reason))
+
+  if item_safe then
+    blocks = blocks + 1
+    safe.note_invocation(HOOK_KEY_REDUCE, "SKIP (" .. tostring(reason) .. ")")
+    return sdk.PreHookResult.SKIP_ORIGINAL
+  end
+
+  safe.note_invocation(HOOK_KEY_REDUCE, "pass (" .. tostring(reason) .. ")")
   return sdk.PreHookResult.CALL_ORIGINAL
 end
 

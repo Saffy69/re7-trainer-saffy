@@ -191,6 +191,7 @@ TYPE_DB["app.WeaponGun"] = make_type("app.WeaponGun", nil,
 
 TYPE_DB["app.Inventory"] = make_type("app.Inventory", nil,
   { make_method("getActivePlayerInventory", "app.Inventory", {}),
+    make_method("reduceItem", "System.Boolean", { "System.String", "System.Int32", "System.Int32" }),
     make_method("get_ItemList", "System.Collections.Generic.List`1<app.Inventory.ItemInfo>", {}) },
   { make_field("PlayerStatus", "app.IPlayerStatus"),
     make_field("_ItemList", "System.Collections.Generic.List`1<app.Inventory.ItemInfo>") })
@@ -745,57 +746,30 @@ do
   check("ammo installed no hook", hook_for("app.WeaponGun", "expendBullet") == nil)
 
   local destroy = hook_for("app.Item", "destroyItem")
-  check("inventory hook is on destroyItem", destroy ~= nil)
+  check("inventory observes destroyItem", destroy ~= nil)
 
+  -- destroyItem is count-only now. In game it reported "2 blocked" while the
+  -- items were consumed anyway, and it fires for combining and discarding as
+  -- well as use -- so blocking it was both ineffective and wrong.
   if destroy then
-    -- A fake app.Item whose category we control. This is the safety-critical
-    -- path: a key item MUST NOT be conserved even while the cheat is on.
-    local function fake_item_data(category)
-      return {
-        get_type_definition = function()
-          return { get_full_name = function() return "app.ItemData" end }
-        end,
-        get_field = function(_, name)
-          if name == "Category" then return category end
-          return nil
-        end,
-        call = function() return nil end,
-      }
-    end
+    check("destroyItem never blocks",
+          destroy.pre({ [1] = nil, [2] = nil }) == sdk.PreHookResult.CALL_ORIGINAL)
+  end
 
-    local function fake_item(category)
-      return {
-        get_type_definition = function()
-          return { get_full_name = function() return "app.Item" end }
-        end,
-        call = function(_, name)
-          if name == "get_ItemData" then return fake_item_data(category) end
-          return nil
-        end,
-        get_field = function(_, name)
-          if name == "_ItemData" then return fake_item_data(category) end
-          return nil
-        end,
-      }
-    end
+  -- The gate moved to Inventory.reduceItem.
+  local reduce = hook_for("app.Inventory", "reduceItem")
+  check("inventory gates reduceItem", reduce ~= nil)
 
-    check("drug destruction is blocked while enabled",
-          destroy.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.SKIP_ORIGINAL)
-
-    check("KeyItem destruction is NOT blocked",
-          destroy.pre({ [1] = nil, [2] = fake_item("KeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
-    check("UsableKeyItem destruction is NOT blocked",
-          destroy.pre({ [1] = nil, [2] = fake_item("UsableKeyItem") }) == sdk.PreHookResult.CALL_ORIGINAL)
-    check("Weapon destruction is NOT blocked",
-          destroy.pre({ [1] = nil, [2] = fake_item("Weapon") }) == sdk.PreHookResult.CALL_ORIGINAL)
-
-    -- Fail closed: an unreadable category must not be treated as safe.
-    check("unreadable category is NOT blocked",
-          destroy.pre({ [1] = nil, [2] = fake_item(nil) }) == sdk.PreHookResult.CALL_ORIGINAL)
+  if reduce then
+    -- reduceItem identifies its item by an id string. With an unreadable id it
+    -- must pass through, because blocking an unidentifiable call could consume
+    -- a key item or desync the inventory.
+    check("reduceItem passes when the id is unreadable",
+          reduce.pre({ [1] = nil, [2] = nil, [3] = nil }) == sdk.PreHookResult.CALL_ORIGINAL)
 
     inventory.disable()
-    check("nothing is blocked while disabled",
-          destroy.pre({ [1] = nil, [2] = fake_item("Drug") }) == sdk.PreHookResult.CALL_ORIGINAL)
+    check("reduceItem passes while disabled",
+          reduce.pre({ [1] = nil, [2] = nil, [3] = nil }) == sdk.PreHookResult.CALL_ORIGINAL)
     inventory.enable()
   end
 end
