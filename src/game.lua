@@ -327,53 +327,21 @@ function M.item_infos()
   local type_helpers = require("re7trainer.utils.type_helpers")
 
   -- Route A: the public accessor.
-  local via_method = type_helpers.to_array(objects.call(inventory, "get_ItemList"))
+  local via_method, how_method = type_helpers.to_managed_list(objects.call(inventory, "get_ItemList"))
   if #via_method > 0 then
-    return via_method, "get_ItemList()"
+    return via_method, "get_ItemList() [" .. how_method .. "]"
   end
 
   -- Route B: the backing field.
-  local via_field = type_helpers.to_array(objects.get(inventory, "_ItemList"))
+  local via_field, how_field = type_helpers.to_managed_list(objects.get(inventory, "_ItemList"))
   if #via_field > 0 then
-    return via_field, "_ItemList field"
+    return via_field, "_ItemList field [" .. how_field .. "]"
   end
 
-  -- Neither produced anything. Report what each accessor actually returned AND
-  -- how large the container claims to be -- "returned a container of size 0" and
-  -- "returned a container we could not read" are different problems, and the
-  -- previous message could not tell them apart.
-  local raw_method = objects.call(inventory, "get_ItemList")
-  local raw_field = objects.get(inventory, "_ItemList")
-
-  --- Describe a sol2 container: its type and what it says its size is.
-  local function describe(container)
-    if container == nil then
-      return "nil"
-    end
-    if type(container) ~= "userdata" then
-      return type(container)
-    end
-
-    for _, sizer in ipairs({ "get_size", "size", "get_count" }) do
-      local ok, method = pcall(function() return container[sizer] end)
-      if ok and type(method) == "function" then
-        local ok_call, count = pcall(method, container)
-        if ok_call then
-          return string.format("userdata, %s()=%s", sizer, tostring(count))
-        end
-      end
-    end
-
-    local ok_len, length = pcall(function() return #container end)
-    if ok_len then
-      return string.format("userdata, #=%s", tostring(length))
-    end
-
-    return "userdata, size unknown"
-  end
-
-  return {}, string.format("get_ItemList: %s | _ItemList: %s",
-                           describe(raw_method), describe(raw_field))
+  -- Neither produced anything. Report what each accessor actually returned and
+  -- how it was interpreted -- "returned a list of size 0" and "returned
+  -- something we could not read" are different problems.
+  return {}, string.format("get_ItemList: %s | _ItemList: %s", how_method, how_field)
 end
 
 --- The category of an app.Item, as a name, or nil.

@@ -208,18 +208,32 @@ function M.update()
     return
   end
 
-  if health.current < baseline then
+  -- The value to hold the player at: their maximum, not the level they happened
+  -- to be on when the cheat was switched on.
+  --
+  -- The first version captured health at enable time and restored to THAT, so
+  -- enabling the cheat after taking a hit froze the player at their wounded
+  -- value for the rest of the session. That is not what "Infinite Health" means
+  -- to anyone.
+  local target = health.max
+  if target == nil or target <= 0 then
+    -- Maximum not readable; fall back to the level at enable time so the cheat
+    -- still does something rather than silently refusing.
+    target = baseline or health.current
+  end
+
+  if health.current < target - 0.01 then
     -- Damage was applied since the last frame. Put it back -- and only count it
     -- as a restore if the write actually took. An earlier version incremented
     -- this counter whenever the call did not error, which produced hundreds of
     -- "restored" reports while health kept dropping.
-    local ok, detail = game.set_health(baseline)
-    if ok then
+    local applier, detail = game.set_health(target)
+    if applier then
       restores = restores + 1
       last_write_error = nil
       logger.throttled("health:restore", 300, "debug", "Health",
                        string.format("Restored health %.1f -> %.1f via %s",
-                                     health.current, baseline, tostring(detail)))
+                                     health.current, target, tostring(detail)))
     else
       write_failures = write_failures + 1
       last_write_error = tostring(detail)
@@ -227,7 +241,8 @@ function M.update()
                        "Could not restore health: " .. tostring(detail))
     end
   else
-    -- Same or higher: accept it, so healing and pickups are not undone.
+    -- At or above the target: a heal, a pickup, or a story event pushed it up.
+    -- Track it so the baseline stays meaningful if max is ever unreadable.
     baseline = health.current
   end
 end
