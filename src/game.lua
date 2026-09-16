@@ -338,13 +338,42 @@ function M.item_infos()
     return via_field, "_ItemList field"
   end
 
-  -- Neither produced anything. Report which shapes were seen so the next step
-  -- is a readout rather than another guess.
+  -- Neither produced anything. Report what each accessor actually returned AND
+  -- how large the container claims to be -- "returned a container of size 0" and
+  -- "returned a container we could not read" are different problems, and the
+  -- previous message could not tell them apart.
   local raw_method = objects.call(inventory, "get_ItemList")
   local raw_field = objects.get(inventory, "_ItemList")
 
-  return {}, string.format("both empty (get_ItemList=%s, _ItemList=%s)",
-                           type(raw_method), type(raw_field))
+  --- Describe a sol2 container: its type and what it says its size is.
+  local function describe(container)
+    if container == nil then
+      return "nil"
+    end
+    if type(container) ~= "userdata" then
+      return type(container)
+    end
+
+    for _, sizer in ipairs({ "get_size", "size", "get_count" }) do
+      local ok, method = pcall(function() return container[sizer] end)
+      if ok and type(method) == "function" then
+        local ok_call, count = pcall(method, container)
+        if ok_call then
+          return string.format("userdata, %s()=%s", sizer, tostring(count))
+        end
+      end
+    end
+
+    local ok_len, length = pcall(function() return #container end)
+    if ok_len then
+      return string.format("userdata, #=%s", tostring(length))
+    end
+
+    return "userdata, size unknown"
+  end
+
+  return {}, string.format("get_ItemList: %s | _ItemList: %s",
+                           describe(raw_method), describe(raw_field))
 end
 
 --- The category of an app.Item, as a name, or nil.
@@ -518,12 +547,100 @@ function M.gun_ammo(gun)
   }
 end
 
+--- The gun's current bullet record -- where the magazine count actually lives.
+--
+-- app.WeaponGun.get_loadNum() reads a value derived from this, which is why
+-- calling the gun's own set_loadNum had no effect in game: the game recomputes
+-- it from CurrentBulletInfo on the next update.
+--
+-- @param gun userdata|nil
+-- @return userdata|nil app.WeaponGun.BulletInfo
+function M.current_bullet_info(gun)
+  gun = gun or M.equipped_gun()
+  if gun == nil then
+    return nil
+  end
+
+  local info = objects.call(gun, "get_CurrentBulletInfo")
+  if info == nil then
+    info = objects.get(gun, "CurrentBulletInfo")
+  end
+
+  if info == nil or not objects.is_valid(info) then
+    return nil
+  end
+  return info
+end
+
+--- The gun's parameter block, which carries the game's own infinity flags.
+-- @param gun userdata|nil
+-- @return userdata|nil app.WeaponGunParameter
+function M.gun_parameter(gun)
+  gun = gun or M.equipped_gun()
+  if gun == nil then
+    return nil
+  end
+
+  local param = objects.call(gun, "get_WeaponGunParameter")
+  if param == nil then
+    param = objects.get(gun, "WeaponGunParameter")
+  end
+
+  if param == nil or not objects.is_valid(param) then
+    return nil
+  end
+  return param
+end
+
+--- Turn the game's own unlimited-magazine flag on or off.
+--
+-- app.WeaponGunParameter carries `IsLoadNumInfinity` and
+-- `IsBulletStackNumInfinity` as plain writable booleans, and app.WeaponGun
+-- already exposes get_isLoadNumInfinity() over them. So RE7 has a built-in
+-- infinite-ammo concept, and this uses it rather than fighting the counter.
+--
+-- This is the preferred mechanism and is strictly better than restoring a
+-- number every frame: the value is never wrong, not even for one frame, and no
+-- write happens per shot.
+--
+-- Prefers a setter if one exists, falls back to the field.
+--
+-- @param on boolean
+-- @param gun userdata|nil
+-- @return boolean ok, string detail
+function M.set_infinite_magazine(on, gun)
+  local param = M.gun_parameter(gun)
+  if param == nil then
+    return false, "WeaponGunParameter unreachable"
+  end
+
+  local wanted = on == true
+
+  -- Setter first, if the type provides one.
+  if safe.call_method(param, "set_IsLoadNumInfinity", wanted) then
+    local check = objects.get(param, "IsLoadNumInfinity")
+    if check == wanted then
+      return true, "set_IsLoadNumInfinity"
+    end
+  end
+
+  if objects.set(param, "IsLoadNumInfinity", wanted) then
+    local check = objects.get(param, "IsLoadNumInfinity")
+    if check == wanted then
+      return true, "IsLoadNumInfinity field"
+    end
+    return false, "field write had no effect (reads back " .. tostring(check) .. ")"
+  end
+
+  return false, "could not write IsLoadNumInfinity"
+end
+
 --- Write a gun's magazine count, and VERIFY the write took.
 --
--- set_loadNum is the method the game itself calls to change the magazine --
--- confirmed in game, six calls while emptying a magazine and reloading. But a
--- call that reports success is not evidence the value changed, which is exactly
--- how the health write failed. So this re-reads and reports what happened.
+-- Writes CurrentBulletInfo.LoadNum, NOT the gun's own set_loadNum. In game,
+-- gun:set_loadNum(4) was accepted and left the count at 3 -- the gun derives
+-- its loadNum from CurrentBulletInfo, so writing the derived value is
+-- overwritten immediately.
 --
 -- @param value number
 -- @param gun userdata|nil defaults to the equipped gun
@@ -534,23 +651,38 @@ function M.set_magazine(value, gun)
     return false, "no gun"
   end
 
-  if not safe.call_method(gun, "set_loadNum", value) then
-    return false, "set_loadNum call failed"
+  local bullet_info = M.current_bullet_info(gun)
+  if bullet_info == nil then
+    return false, "CurrentBulletInfo unreachable"
   end
 
-  local after = safe.to_number(objects.call(gun, "get_loadNum"))
-  if after == nil then
-    return false, "unreadable after write"
+  --- Confirm by re-reading the gun's own accessor, which is what the HUD uses.
+  local function verify(route)
+    local after = safe.to_number(objects.call(gun, "get_loadNum"))
+    if after == nil then
+      return false, route .. ": unreadable after write"
+    end
+    if math.abs(after - value) < 0.5 then
+      return true, route
+    end
+    return false, string.format("%s: no effect (now %.0f, wanted %.0f)", route, after, value)
   end
 
-  if math.abs(after - value) < 0.5 then
-    return true, "set_loadNum"
+  if safe.call_method(bullet_info, "set_loadNum", value) then
+    local ok, detail = verify("BulletInfo.set_loadNum")
+    if ok then
+      return true, detail
+    end
   end
 
-  -- The call was accepted and did nothing. Say so rather than reporting a
-  -- restore that never happened.
-  return false, string.format("set_loadNum had no effect (%.0f -> %.0f, wanted %.0f)",
-                              value, after, value)
+  if objects.set(bullet_info, "LoadNum", value) then
+    local ok, detail = verify("BulletInfo.LoadNum field")
+    if ok then
+      return true, detail
+    end
+  end
+
+  return false, "no route to the magazine had any effect"
 end
 
 --- Write an item's stack count.
