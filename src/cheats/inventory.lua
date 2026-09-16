@@ -49,8 +49,20 @@ M.LABEL = "Infinite Items"
 
 local HOOK_KEY = "app.Item.destroyItem"
 
+--- The inventory-level decrement, which is the route the item actually leaves
+--- by. Blocking destroyItem alone was not enough.
+local HOOK_KEY_REDUCE = "app.Inventory.reduceItem"
+
 local enabled = false
 local hook_ready = false
+
+--- Whether reduceItem -- the hook that actually matters -- installed.
+local reduce_hooked = false
+
+--- Last observed reduceItem arguments, for the debug panel. Empty until the
+--- game calls it, and the single most useful thing to know if this hook is
+--- passing through when it should not be.
+local last_args = ""
 
 --- itemDataID -> last observed stack count.
 local baseline = {}
@@ -154,18 +166,115 @@ local function on_destroy_item(args)
   return sdk.PreHookResult.SKIP_ORIGINAL
 end
 
+--- The reduceItem hook: the inventory-level decrement.
+--
+-- WHY THIS AND NOT destroyItem
+-- ----------------------------
+-- Blocking destroyItem was confirmed to work -- the panel read "2 blocked" --
+-- and the items were still consumed. So destroyItem is a lifecycle
+-- notification, not the removal itself; the item leaves the inventory by
+-- another route. reduceItem is that route, and the probe confirmed it fires on
+-- consumption.
+--
+-- THE GATING PROBLEM, AND HOW IT IS HANDLED
+-- -----------------------------------------
+-- reduceItem takes three parameters and their meaning is not known -- they
+-- could be an item, an item id, a count. Rather than guess, each parameter is
+-- examined: anything that resolves to a real app.Item is classified through the
+-- same gate as everywhere else, and if NONE of them can be identified as a
+-- conservable item, the call passes through untouched.
+--
+-- That is the fail-closed direction. An unidentifiable call is never blocked,
+-- because blocking the wrong one could consume a key item or desync the
+-- inventory.
+--
+-- args layout, from the verified sdk.hook signature:
+--   args[1] = REThreadContext*, args[2] = `this` (the app.Inventory)
+--   args[3..] = parameters
+-- @param args table
+local function on_reduce_item(args)
+  if not enabled or state.prefs.trainer_enabled ~= true then
+    safe.note_invocation(HOOK_KEY, "pass (disabled)")
+    return sdk.PreHookResult.CALL_ORIGINAL
+  end
+
+  -- Examine each parameter. The first one that looks like an app.Item decides.
+  local examined = {}
+
+  for i = 3, 5 do
+    local raw = args[i]
+    if raw ~= nil then
+      local as_object = safe.to_managed_object(raw)
+
+      if as_object ~= nil then
+        local type_name = objects.type_name(as_object) or "?"
+        examined[#examined + 1] = string.format("[%d]=%s", i, type_name)
+
+        if type_name == "app.Item" or type_name:find("Item", 1, true) then
+          local item_safe, reason = game.is_safe_to_conserve(as_object)
+
+          if item_safe then
+            blocks = blocks + 1
+            safe.note_invocation(HOOK_KEY, "SKIP (" .. tostring(reason) .. ")")
+            return sdk.PreHookResult.SKIP_ORIGINAL
+          end
+
+          -- A readable item that is not conservable: let it through, and say so.
+          safe.note_invocation(HOOK_KEY, "pass (" .. tostring(reason) .. ")")
+          return sdk.PreHookResult.CALL_ORIGINAL
+        end
+      else
+        -- Not a managed object -- record it as a plain value so the panel shows
+        -- what the parameters actually are.
+        local as_number = safe.to_number(raw)
+        examined[#examined + 1] = string.format("[%d]=%s", i,
+          as_number ~= nil and tostring(as_number) or type(raw))
+      end
+    end
+  end
+
+  last_args = table.concat(examined, " ")
+
+  -- Nothing identifiable. Pass through rather than risk blocking the wrong
+  -- thing.
+  safe.note_invocation(HOOK_KEY, "pass (unidentified args)")
+  return sdk.PreHookResult.CALL_ORIGINAL
+end
+
+--- Install both hooks.
+--
+-- Declared after the callbacks it references: a Lua local is not in scope
+-- before its declaration, and putting this above them compiles fine and then
+-- fails at runtime passing nil to sdk.hook.
 local function ensure_hook()
   if hook_ready then
     return true, nil
   end
 
-  local ok, detail = safe.hook_method(
+  -- Both hooks are needed, and they do different jobs:
+  --
+  --   Item.destroyItem      -- the item's own lifecycle. Confirmed to fire, and
+  --                            blocking it was confirmed to work ("2 blocked")
+  --                            yet the item was still consumed, so this alone
+  --                            is not sufficient.
+  --   Inventory.reduceItem  -- the inventory-level decrement, which is the route
+  --                            the item actually leaves by.
+  --
+  -- At least one must install for the cheat to claim it can work.
+  local destroy_ok, destroy_detail = safe.hook_method(
     HOOK_KEY, "app.Item", "destroyItem", on_destroy_item, nil)
 
-  if ok then
-    hook_ready = true
+  local reduce_ok, reduce_detail = safe.hook_method(
+    HOOK_KEY_REDUCE, "app.Inventory", "reduceItem", on_reduce_item, nil)
+
+  if not destroy_ok and not reduce_ok then
+    return false, string.format("destroyItem: %s | reduceItem: %s",
+                                tostring(destroy_detail), tostring(reduce_detail))
   end
-  return ok, detail
+
+  reduce_hooked = reduce_ok
+  hook_ready = true
+  return true, nil
 end
 
 --- @return boolean ok, string message
@@ -294,6 +403,16 @@ function M.update()
 
   logger.throttled("inv:survey", 1800, "debug", "Inventory",
                    string.format("%d of %d carried items are conservable.", safe_seen, tracked))
+end
+
+--- What reduceItem last received, for the debug panel.
+--
+-- If the cheat is passing through when it should be blocking, this is the line
+-- that says why: it shows which parameters arrived and what each was
+-- interpreted as.
+-- @return string
+function M.reduce_args()
+  return last_args
 end
 
 --- @return table|nil
