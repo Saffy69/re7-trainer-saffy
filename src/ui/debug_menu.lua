@@ -353,6 +353,53 @@ local function draw_item_classification()
   end
 end
 
+--- Draw what is reachable on the equipped weapon.
+--
+-- The ammo cheat reported "CurrentBulletInfo unreachable" while get_loadNum()
+-- read fine from the same object, so the gun is reachable but the nested
+-- objects the magazine lives on are not. Rather than guess at another accessor,
+-- this walks the specific field names the discovery dump lists on
+-- app.WeaponGun and reports which ones actually resolve.
+local function draw_gun_access()
+  local game = require("re7trainer.game")
+  local objects = require("re7trainer.utils.object_helpers")
+  local safe = require("re7trainer.utils.safe_call")
+
+  W.spacing()
+  W.text("Weapon access")
+
+  local gun = game.equipped_gun()
+  if gun == nil then
+    W.text("  no gun equipped or reachable")
+    return
+  end
+
+  W.field("  gun type", tostring(objects.type_name(gun)))
+  W.field("  get_loadNum()", tostring(safe.to_number(objects.call(gun, "get_loadNum"))))
+
+  -- The field names the dump attributes to app.WeaponGun, plus the accessors
+  -- that would return them. Each is reported separately so a miss is precise.
+  local candidates = {
+    "CurrentBulletInfo",
+    "BulletInfoList",
+    "WeaponGunParameter",
+    "Inventory",
+  }
+
+  for _, name in ipairs(candidates) do
+    local via_field = objects.get(gun, name)
+    local via_method = objects.call(gun, "get_" .. name)
+
+    local reachable = via_method or via_field
+    if reachable ~= nil then
+      W.text(string.format("  %s: reached via %s", name,
+              via_method ~= nil and ("get_" .. name .. "()") or "field"))
+    else
+      W.text(string.format("  %s: unreachable (field and get_%s both nil)", name, name))
+    end
+  end
+end
+
 --- Draw the whole debug panel.
 function M.draw()
   if not W.available() then
@@ -363,6 +410,7 @@ function M.draw()
   draw_discovery_state()
   draw_live_values()
   draw_game_access()
+  draw_gun_access()
   draw_item_classification()
   draw_hooks()
   draw_hook_probe()

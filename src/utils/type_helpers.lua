@@ -163,7 +163,7 @@ local function describe_shape(value)
   return info
 end
 
---- Convert whatever an accessor returned into a plain Lua array.
+--- Convert a raw accessor result into a plain Lua array.
 --
 -- The accessors return std::vector<T*>, which sol2 exposes as a CONTAINER
 -- USERDATA in this build -- not a Lua table. Rather than assume one shape and
@@ -308,6 +308,80 @@ end
 -- shape is handled, so the selfcheck exercises it directly rather than
 -- relying on the game being present.
 M.to_array = to_array
+
+--- Convert a returned value into a Lua array, including MANAGED collection types.
+--
+-- WHY THIS EXISTS SEPARATELY FROM to_array
+-- ----------------------------------------
+-- In game, app.Inventory.get_ItemList() and its backing _ItemList field both
+-- returned userdata with no size(), no length operator and no iteration -- so
+-- to_array gave up and reported "size unknown" for both.
+--
+-- That is because a managed System.Collections.Generic.List`1<T> is NOT a sol2
+-- container. It is a managed object, marshalled across as an opaque userdata,
+-- and the way to read it is through its own managed methods: get_Count() and
+-- get_Item(index). Treating it as a Lua sequence was never going to work.
+--
+-- Declared after to_array on purpose: it calls it, and a Lua local is not in
+-- scope before its declaration. Placing this above to_array compiled fine and
+-- then failed at runtime with "attempt to call a nil value".
+--
+-- @param value any
+-- @return table array
+-- @return string which strategy worked, for diagnostics
+function M.to_managed_list(value)
+  if value == nil then
+    return {}, "nil"
+  end
+
+  if type(value) == "table" then
+    return to_array(value), "lua table"
+  end
+
+  if type(value) ~= "userdata" then
+    return {}, "not a container (" .. type(value) .. ")"
+  end
+
+  -- Managed List<T>: get_Count() and get_Item(i). Note the 0-based index --
+  -- this is a .NET collection, not a Lua sequence.
+  local ok_count, count = pcall(function()
+    return value:call("get_Count")
+  end)
+  count = tonumber(count)
+
+  if ok_count and count ~= nil and count >= 0 then
+    local out = {}
+    local failed_at = nil
+
+    for i = 0, count - 1 do
+      local ok_item, item = pcall(function()
+        return value:call("get_Item", i)
+      end)
+
+      if not ok_item or item == nil then
+        failed_at = i
+        break
+      end
+      out[#out + 1] = item
+    end
+
+    if failed_at == nil then
+      return out, string.format("managed List, get_Count()=%d", count)
+    end
+
+    -- A partial read is reported as such rather than silently truncated.
+    return out, string.format("managed List, get_Count()=%d but get_Item(%d) failed",
+                              count, failed_at)
+  end
+
+  -- Not a managed list. Fall back to the sol2-container strategies.
+  local as_container = to_array(value)
+  if #as_container > 0 then
+    return as_container, "sol2 container"
+  end
+
+  return {}, "userdata, neither a managed List nor a readable container"
+end
 
 --- Declared methods of a type.
 -- @param type_definition userdata
