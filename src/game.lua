@@ -285,24 +285,32 @@ end
 -- Items and their categories
 -- ---------------------------------------------------------------------------
 
---- Item categories the trainer is allowed to conserve.
+--- Category values the trainer is allowed to conserve.
 --
--- This is the list that makes Infinite Items safe. Everything NOT in this set
--- is treated as untouchable, which is the conservative direction and the one
--- that cannot corrupt a save.
+-- READ OFF THE RUNNING GAME, not from the enum's declaration order.
 --
---   Drug      herbs, first aid -- stackable, consumed
---   Material  chem fluids, crafting -- stackable, consumed
---   Shell     ammunition -- stackable, consumed
+-- A live item dump on build 22773795 reported these, each with the item it came
+-- from, and the mapping is consistent across every sample:
 --
--- Deliberately absent, and therefore never touched:
---   KeyItem, UsableKeyItem, DiscardableKeyItem  -- key items gate puzzles;
---       duplicating one can make a run unrecoverable
---   Weapon, StackWeapon                          -- not consumables
---   File, Map                                    -- documents
---   SupplyBox, OtherItem                         -- not proven stackable
+--   1  Knife, Handgun G17          -> Weapon
+--   2  ShotgunBullet, HandgunBullet -> Shell       CONSERVE
+--   3  RemedyM, Stimulant           -> Drug        CONSERVE
+--   4  MorgueKey                    -> KeyItem
+--   7  ChemicalM                    -> Material    CONSERVE
 --
--- The enum members were read out of app.Item.ItemCategoryType in a live dump.
+-- The enum's own member names sort alphabetically in a reflection listing, so
+-- the names cannot be paired with numbers by position -- the numbers had to be
+-- observed. Only the three conservable values are listed; everything else,
+-- including any value not seen here, is treated as untouchable.
+M.SAFE_CATEGORY_VALUES = {
+  [2] = "Shell",
+  [3] = "Drug",
+  [7] = "Material",
+}
+
+--- Category names the trainer is allowed to conserve, when a name is available.
+-- Kept for the case where a build surfaces the enum as a string instead of a
+-- number; both spellings of the same set are accepted.
 M.SAFE_CATEGORIES = {
   Drug = true,
   Material = true,
@@ -344,25 +352,24 @@ function M.item_infos()
   return {}, string.format("get_ItemList: %s | _ItemList: %s", how_method, how_field)
 end
 
---- The category of an app.Item, as a name, or nil.
+--- The category of an app.Item, or nil.
 --
--- WHY THIS IS SO DEFENSIVE
--- ------------------------
--- The first version read app.ItemData.Category and expected a string. In game
--- it came back unreadable, and the hook logged "pass (category unreadable)" --
--- so the gate refused everything, correctly, and the cheat did nothing.
+-- Returns TWO values: a display name (which may be nil) and the raw observed
+-- shape. The numeric value is the authoritative one -- see is_safe_to_conserve,
+-- which does not depend on the name at all.
 --
--- A .NET enum field does not necessarily surface as a Lua string. It may arrive
--- as a number, as a userdata, or as a boxed value object, and which one it is
--- cannot be determined without observing it. Rather than guess a third time,
--- every plausible shape is attempted and the result is reported honestly.
+-- In game the field arrives as a NUMBER (1, 2, 3, 4, 7, ...), not a string.
+-- The first version demanded a string and therefore reported every item as
+-- "category unreadable", which correctly refused everything and made the cheat
+-- do nothing. An enum does not necessarily marshal as a name; here it does not.
 --
 -- @param item userdata app.Item
 -- @return string|nil category_name
--- @return string a short description of what was actually observed, for logging
+-- @return string observation, for logging
+-- @return number|nil raw numeric value
 function M.item_category(item)
   if item == nil then
-    return nil, "no item"
+    return nil, "no item", nil
   end
 
   local item_data = objects.call(item, "get_ItemData")
@@ -370,47 +377,47 @@ function M.item_category(item)
     item_data = objects.get(item, "_ItemData")
   end
   if item_data == nil then
-    return nil, "app.ItemData unreachable"
+    return nil, "app.ItemData unreachable", nil
   end
 
   local raw = objects.get(item_data, "Category")
   if raw == nil then
-    return nil, "Category field unreadable"
+    return nil, "Category field unreadable", nil
   end
 
-  -- Shape 1: already a string.
-  if type(raw) == "string" then
-    return raw, "string"
-  end
-
-  -- Shape 2: a number. Named lookup is impossible without the enum's member
-  -- values, so the caller falls back to the stack-size test below.
+  -- The case that actually occurs: a numeric enum value.
   local as_number = safe.to_number(raw)
   if as_number ~= nil then
-    return nil, "numeric enum value " .. tostring(as_number)
+    local name = M.SAFE_CATEGORY_VALUES[as_number]
+    return name, "numeric value " .. tostring(as_number), as_number
   end
 
-  -- Shape 3: a boxed value with a name accessor.
+  -- A string, if some build surfaces it that way.
+  if type(raw) == "string" then
+    return raw, "string", nil
+  end
+
+  -- A boxed value with a name accessor.
   local name = safe.try(raw, "get_name") or safe.try(raw, "ToString")
   if type(name) == "string" then
-    return name, "boxed"
+    return name, "boxed", nil
   end
 
-  return nil, "unrecognised shape: " .. type(raw)
+  return nil, "unrecognised shape: " .. type(raw), nil
 end
 
 --- Is this item safe for the trainer to conserve?
 --
 -- Two independent gates, in order of confidence:
 --
---   1. The engine's own category enum, when it can be read as a name. This is
---      the precise answer and is preferred whenever available.
+--   1. The engine's category value. This is the precise answer and is preferred
+--      whenever it can be read -- as a number OR a name, since different builds
+--      may surface either.
 --
 --   2. Stackability, as a fallback. An item whose MaxStackNum is greater than 1
---      is by definition a stackable consumable; a key item does not stack. This
---      is not a guess about item names -- it is a different engine-provided fact
---      that happens to divide the same way, and it is why the cheat can still
---      be gated honestly when the enum cannot be read.
+--      is by definition a stackable consumable; a key item does not stack. Not
+--      a guess about item names -- a different engine-provided fact that happens
+--      to divide the same way.
 --
 -- Fails CLOSED: if neither gate can be evaluated, the item is not safe.
 --
@@ -421,8 +428,18 @@ function M.is_safe_to_conserve(item)
     return false, "no item"
   end
 
-  local category, observation = M.item_category(item)
+  local category, observation, numeric = M.item_category(item)
 
+  -- Gate 1a: numeric category. Authoritative when available.
+  if numeric ~= nil then
+    local name = M.SAFE_CATEGORY_VALUES[numeric]
+    if name ~= nil then
+      return true, name .. " (value " .. tostring(numeric) .. ")"
+    end
+    return false, "category value " .. tostring(numeric) .. " is not conservable"
+  end
+
+  -- Gate 1b: named category.
   if category ~= nil then
     if M.SAFE_CATEGORIES[category] then
       return true, category
@@ -430,7 +447,7 @@ function M.is_safe_to_conserve(item)
     return false, "category '" .. category .. "' is not conservable"
   end
 
-  -- Category unreadable. Fall back to stackability.
+  -- Gate 2: category unreadable. Fall back to stackability.
   local max_stack = safe.to_number(objects.call(item, "getMaxStackNum"))
   if max_stack == nil then
     local item_data = objects.call(item, "get_ItemData") or objects.get(item, "_ItemData")
@@ -473,12 +490,28 @@ end
 -- Weapons
 -- ---------------------------------------------------------------------------
 
---- The currently equipped gun, or nil.
+--- The currently equipped gun: the app.WeaponGun object, not the controller.
 --
--- Reached from app.PlayerStatus.PlayerGun. The inventory item list also carries
--- a Gun reference per item (app.Inventory.ItemInfo.Gun), which is the better
--- route if this one returns nil — an equipped-weapon field can legitimately be
--- empty while the player is unarmed.
+-- THE HOP THAT WAS MISSING
+-- ------------------------
+-- app.PlayerStatus.PlayerGun is an app.PlayerGun, and app.PlayerGun is a
+-- CONTROLLER -- it derives from app.PlayerBase and carries 230 methods of
+-- aiming, reloading and firing state. It is not the gun.
+--
+-- It holds the actual weapon in a field:
+--
+--     app.PlayerGun
+--       F app.WeaponGun WeaponGun
+--
+-- app.PlayerGun does expose get_loadNum(), which is why the magazine read
+-- worked while everything nested on the real gun did not: that accessor is a
+-- passthrough to a weapon this function was never reaching. WeaponGunParameter
+-- and CurrentBulletInfo live on app.WeaponGun, so they were unreachable by
+-- construction.
+--
+-- Falls back to the controller itself when the weapon field is empty, so a
+-- partially-initialised state still yields something readable.
+--
 -- @return userdata|nil app.WeaponGun
 function M.equipped_gun()
   local status = M.player_status()
@@ -486,12 +519,24 @@ function M.equipped_gun()
     return nil
   end
 
-  local gun = objects.get(status, "PlayerGun")
-  if gun ~= nil and objects.is_valid(gun) then
-    return gun
+  local controller = objects.get(status, "PlayerGun")
+  if controller == nil or not objects.is_valid(controller) then
+    return nil
   end
 
-  return nil
+  -- The real weapon.
+  local weapon = objects.call(controller, "get_WeaponGun")
+  if weapon == nil then
+    weapon = objects.get(controller, "WeaponGun")
+  end
+
+  if weapon ~= nil and objects.is_valid(weapon) then
+    return weapon
+  end
+
+  -- Some states (unarmed, mid-swap) have no weapon object. The controller can
+  -- still report a magazine count, so return it rather than reporting nothing.
+  return controller
 end
 
 --- Magazine and reserve counts for a gun, or nil.
