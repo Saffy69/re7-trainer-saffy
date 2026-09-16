@@ -40,35 +40,39 @@ local M = {}
 
 --- Methods worth watching, grouped by the action that should trigger them.
 ---
---- Deliberately wide. The point is to bracket the truth rather than bet on one
---- candidate: if none of the damage-side entries fire when you are hit, the
---- real path is somewhere none of them reach, which is itself decisive.
+--- DELIBERATELY SMALL AND DELIBERATELY COLD.
+---
+--- An earlier version of this list included doUpdate and doLateUpdate. That was
+--- a mistake: those run every frame, on EVERY instance of the type. Hooking
+--- app.Item.doUpdate means every item in the world calls into Lua every frame,
+--- and the Lua lock is held for each call. Installing a batch of those crashed
+--- the game.
+---
+--- The rule now: only watch methods that run once per player ACTION -- one call
+--- per shot, one call per hit, one call per item consumed. Those are the ones
+--- whose call count is meaningful anyway; a per-frame method tells you nothing
+--- about which action happened.
+---
+--- safe_call.hook_method additionally refuses any method with no resolved
+--- implementation, so a stub target cannot be reached from here either.
 M.WATCH = {
   damage = {
     { "app.PlayerDamageController", "doDamage" },
     { "app.PlayerDamageController", "calcDamage" },
     { "app.PlayerDamageController", "calcDamageValue" },
-    { "app.PlayerDamageController", "doUpdate" },
-    { "app.PlayerDamageController", "doLateUpdate" },
     { "app.DamageController", "doDamage" },
     { "app.Collision.DamageManager", "doDamage" },
-    { "app.Collision.HitController", "doDamage" },
   },
   ammo = {
     { "app.WeaponGun", "expendBullet" },
     { "app.WeaponGun", "shoot" },
-    { "app.WeaponGun", "shootStart" },
-    { "app.WeaponGun", "shootEnd" },
     { "app.WeaponGun", "set_loadNum" },
     { "app.WeaponGun", "reload" },
-    { "app.WeaponGun", "doUpdate" },
   },
   items = {
     { "app.Item", "reduceNum" },
     { "app.Item", "useItem" },
-    { "app.Item", "setStackNum" },
     { "app.Item", "destroyItem" },
-    { "app.Item", "doUpdate" },
     { "app.Inventory", "reduceItem" },
     { "app.Inventory", "interimItemUse" },
   },
@@ -77,45 +81,60 @@ M.WATCH = {
 --- Methods that are already watched, so a re-run does not stack duplicates.
 local watching = {}
 
---- Install count-only hooks on every candidate that exists.
+--- Install count-only hooks for one group of candidates.
 --
--- Nonexistent types and methods are skipped silently: this list is deliberately
--- broad and several entries are expected to miss.
--- @return number installed, number attempted
-function M.install()
+-- Group-scoped on purpose. An earlier version installed everything in one
+-- press; when that crashed the game, there was no way to tell which of twenty
+-- candidates was responsible. One group per press means a crash narrows to
+-- four or five names instead of twenty.
+--
+-- @param group string  "damage" | "ammo" | "items"
+-- @return number installed, number attempted, table array of failure reasons
+function M.install(group)
+  local entries = M.WATCH[group]
+  if entries == nil then
+    return 0, 0, { "unknown group: " .. tostring(group) }
+  end
+
   local installed_count, attempted = 0, 0
+  local failures = {}
 
-  for group, entries in pairs(M.WATCH) do
-    for _, entry in ipairs(entries) do
-      local type_name, method_name = entry[1], entry[2]
-      local key = type_name .. "." .. method_name
-      attempted = attempted + 1
+  for _, entry in ipairs(entries) do
+    local type_name, method_name = entry[1], entry[2]
+    local key = type_name .. "." .. method_name
+    attempted = attempted + 1
 
-      if not watching[key] then
-        -- A counter-only callback. It returns CALL_ORIGINAL unconditionally so
-        -- the observed behaviour is exactly the unmodified game behaviour.
-        local ok = safe.hook_method(
-          key, type_name, method_name,
-          function()
-            safe.note_invocation(key, "counted")
-            return sdk.PreHookResult.CALL_ORIGINAL
-          end,
-          nil
-        )
+    if watching[key] then
+      installed_count = installed_count + 1
+    else
+      -- A counter-only callback. It returns CALL_ORIGINAL unconditionally so
+      -- the observed behaviour is exactly the unmodified game behaviour.
+      --
+      -- safe_call.hook_method refuses targets with no resolved implementation,
+      -- which is the guard that matters here: hooking a stub patches stub
+      -- memory, and that is a plausible cause of the earlier crash.
+      local ok, detail = safe.hook_method(
+        key, type_name, method_name,
+        function()
+          safe.note_invocation(key, "counted")
+          return sdk.PreHookResult.CALL_ORIGINAL
+        end,
+        nil
+      )
 
-        if ok then
-          watching[key] = group
-          installed_count = installed_count + 1
-        end
+      if ok then
+        watching[key] = group
+        installed_count = installed_count + 1
+      else
+        failures[#failures + 1] = key .. ": " .. tostring(detail)
       end
     end
   end
 
   logger.info("HookProbe", string.format(
-    "Watching %d of %d candidate methods. Play normally, then read the panel.",
-    installed_count, attempted))
+    "Group '%s': watching %d of %d candidates.", group, installed_count, attempted))
 
-  return installed_count, attempted
+  return installed_count, attempted, failures
 end
 
 --- Snapshot current counts, keyed by method.

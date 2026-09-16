@@ -699,6 +699,51 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+-- Hook safety gate
+--
+-- The most important property of hook installation: a method that exists but
+-- has NO RESOLVED IMPLEMENTATION must be refused. get_method(name) does not
+-- filter; get_methods() does. Hooking an unfiltered descriptor patches stub
+-- memory -- which in practice ranged from silently doing nothing (the first
+-- in-game test) to crashing the game outright (the batch probe).
+-- ---------------------------------------------------------------------------
+
+io.write("\nhook safety gate\n")
+do
+  local safe = require("re7trainer.utils.safe_call")
+
+  -- A stub method: returned by get_method, absent from get_methods.
+  local stub_method = make_method("stubOnly", "System.Void", {})
+  TYPE_DB["app.Stubby"] = {
+    get_full_name = function() return "app.Stubby" end,
+    get_name = function() return "app.Stubby" end,
+    get_methods = function() return {} end,           -- filtered view: empty
+    get_fields = function() return {} end,
+    get_parent_type = function() return nil end,
+    get_method = function(_, name)                     -- unfiltered: returns it
+      if name == "stubOnly" then return stub_method end
+      return nil
+    end,
+  }
+
+  local before = #HOOKS_INSTALLED
+  local ok, detail = safe.hook_method(
+    "app.Stubby.stubOnly", "app.Stubby", "stubOnly", function() end, nil)
+
+  check("stub method is refused", ok == false, tostring(detail))
+  check("no hook was installed for a stub", #HOOKS_INSTALLED == before,
+        string.format("%d installed", #HOOKS_INSTALLED - before))
+
+  -- A resolved method must still be accepted. applyDamage IS in the fake
+  -- type's filtered get_methods() list, so it has a real implementation as far
+  -- as the guard is concerned.
+  local ok_real = safe.hook_method(
+    "app.PlayerDamageController.applyDamage", "app.PlayerDamageController", "applyDamage",
+    function() return sdk.PreHookResult.CALL_ORIGINAL end, nil)
+  check("resolved method is accepted", ok_real == true)
+end
+
+-- ---------------------------------------------------------------------------
 -- Report
 -- ---------------------------------------------------------------------------
 
