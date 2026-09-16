@@ -719,14 +719,17 @@ do
   check("ammo enables", (ammo.enable()))
   check("inventory enables", (inventory.enable()))
 
-  -- Only the inventory cheat hooks anything now. Health and ammo use
-  -- read-and-restore, because the probe established that the methods they
-  -- originally hooked are not on the paths that matter.
-  check("inventory installed its hook", #HOOKS_INSTALLED == before + 1,
+  -- Only the inventory cheat hooks anything now. Health and ammo use the
+  -- game's own mechanisms and read-and-restore, because the methods they
+  -- originally hooked turned out not to be on the paths that matter.
+  --
+  -- Inventory installs TWO: destroyItem (observation only) and reduceItem
+  -- (the gate).
+  check("inventory installed its hooks", #HOOKS_INSTALLED == before + 2,
         string.format("%d installed", #HOOKS_INSTALLED - before))
 
   inventory.enable()
-  check("re-enable does not stack hooks", #HOOKS_INSTALLED == before + 1,
+  check("re-enable does not stack hooks", #HOOKS_INSTALLED == before + 2,
         string.format("%d installed", #HOOKS_INSTALLED - before))
 
   -- Locate an installed hook by the method it was attached to. Matching on the
