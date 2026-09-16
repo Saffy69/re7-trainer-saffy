@@ -39,14 +39,35 @@ local SCHEMA_VERSION = 1
 
 --- Keys that are safe to round-trip. Anything not listed here is ignored on
 --- load, so an edited or hand-crafted config cannot inject unexpected fields.
+---
+--- THE CHEAT TOGGLES ARE DELIBERATELY ABSENT.
+---
+--- They used to be persisted, and that produced a UI that lied: a stored
+--- god_mode=true rendered a ticked checkbox on the next launch, while the
+--- module behind it had never had enable() called and was doing nothing. The
+--- checkbox said "on", the game behaved as if it were off, and there was no way
+--- to tell from the menu which was true.
+---
+--- Persisting them would require re-running enable() on load, which means the
+--- trainer touching the game before the player has asked it to -- and doing
+--- that at startup, in the main menu, is where the last round of bugs came from.
+---
+--- So: cheats always start OFF, every session. The original brief asked for
+--- exactly that, and it removes a whole class of "it says on but nothing
+--- happens" confusion.
 local PERSISTED_KEYS = {
   "trainer_enabled",
-  "god_mode",
-  "infinite_ammo",
-  "infinite_items",
   "debug_mode",
   "discovery_mode",
   "log_discovery",
+}
+
+--- Preference keys that exist but are never written to disk. Applied on load so
+--- a stale value from an older config cannot resurrect a ticked checkbox.
+local NEVER_PERSISTED_KEYS = {
+  "god_mode",
+  "infinite_ammo",
+  "infinite_items",
 }
 
 --- Is the json library available in this REFramework build?
@@ -91,6 +112,13 @@ function M.load()
       state.prefs[key] = value
       applied = applied + 1
     end
+  end
+
+  -- Force the cheat toggles off, whatever an older config file may still say.
+  -- Without this, upgrading from a version that persisted them would leave a
+  -- ticked checkbox over a module that is not running.
+  for _, key in ipairs(NEVER_PERSISTED_KEYS) do
+    state.prefs[key] = false
   end
 
   logger.info(nil, string.format("Loaded %d setting(s) from %s.", applied, M.FILE))
