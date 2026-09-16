@@ -239,6 +239,15 @@ local function draw_hooks()
                            entry.invocations,
                            entry.last_decision or "-"))
   end
+
+  -- What reduceItem received on its last call. Shown here rather than only in
+  -- the log because it is the thing that decides whether the items cheat can
+  -- gate the call at all.
+  local inventory = require("re7trainer.cheats.inventory")
+  local args = inventory.reduce_args()
+  if args ~= nil and args ~= "" then
+    W_.text("  reduceItem args: " .. tostring(args))
+  end
 end
 
 --- Draw the method-call probe.
