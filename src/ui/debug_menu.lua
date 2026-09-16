@@ -249,12 +249,20 @@ local function draw_hook_probe()
   W.spacing()
   W.text("Method-call probe")
   W.muted("finds which methods the game actually calls when you act")
+  W.muted("install ONE group at a time, so a crash names the culprit")
 
   W.field("  watching", tostring(probe.watching_count()) .. " method(s)")
 
-  if W.button("Watch method calls") then
-    probe.install()
-    W.text("  installed -- now Mark, then act")
+  -- One button per group. Installing everything at once is what crashed the
+  -- game before, and it left no way to tell which of twenty candidates did it.
+  for _, group in ipairs({ "damage", "ammo", "items" }) do
+    if W.button("Watch " .. group) then
+      local installed, attempted, failures = probe.install(group)
+      W.text(string.format("  %s: %d/%d installed", group, installed, attempted))
+      for _, reason in ipairs(failures or {}) do
+        W.text("    skipped " .. tostring(reason))
+      end
+    end
   end
 
   if W.button("Mark (do this BEFORE the action)") then

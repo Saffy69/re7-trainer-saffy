@@ -371,6 +371,48 @@ function M.hook_method(key, type_name, method_name, pre, post)
     return false, "type not found: " .. type_name
   end
 
+  -- ------------------------------------------------------------------------
+  -- SAFETY GATE: refuse to hook a method with no real implementation.
+  --
+  -- This is not a nicety. RETypeDefinition:get_method(name) does NO filtering
+  -- -- it will happily hand back the descriptor for a method whose function
+  -- pointer is null or whose code is still stub. get_methods() is the filtered
+  -- view: it drops exactly those, which is the framework's own notion of "the
+  -- engine never actually implemented this".
+  --
+  -- Hooking an unfiltered descriptor means patching stub memory. The results
+  -- range from "does nothing" -- which is indistinguishable from a broken
+  -- cheat, and is why the first in-game test showed no effect -- to a hard
+  -- crash, which is what installing a batch of unverified hooks produced.
+  --
+  -- So: a method is only hookable if it ALSO appears in the filtered list.
+  -- ------------------------------------------------------------------------
+  local has_real_implementation = false
+  local ok_list, all_methods = pcall(function()
+    return type_definition:get_methods()
+  end)
+
+  if ok_list and all_methods ~= nil then
+    local type_helpers = require("re7trainer.utils.type_helpers")
+    for _, candidate in ipairs(type_helpers.to_array(all_methods)) do
+      local name_ok, candidate_name = pcall(function()
+        return candidate:get_name()
+      end)
+      if name_ok and candidate_name == method_name then
+        has_real_implementation = true
+        break
+      end
+    end
+  end
+
+  if not has_real_implementation then
+    logger.once("stub:" .. key, "warn", "Hook",
+                "Refusing to hook " .. key .. ": it is not in the filtered method list, "
+                .. "so it has no resolved implementation (null pointer or stub code). "
+                .. "Hooking it would patch stub memory.")
+    return false, "no resolved implementation (stub or never-called)"
+  end
+
   -- get_method takes the method name as an argument, so it cannot go through
   -- M.try (which only calls zero-argument accessors).
   local ok_method, found = pcall(function()
