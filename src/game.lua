@@ -144,6 +144,67 @@ function M.health()
   }
 end
 
+--- The damage controller, which is where health actually lives.
+--
+-- app.PlayerDamageController derives from app.DamageController, and it is the
+-- BASE class that carries the writable health record:
+--
+--     F app.HealthInfo HealthInfo
+--     M app.HealthInfo getHealthInfo()
+--     M System.Void    adjustHealth(?), setHealth(?), recoveryHealth(?)
+--
+-- The subclass exposes only reaction/motion work -- doDamage, playDamage*Motion.
+-- Confirmed in game: hooking PlayerDamageController.doDamage and skipping it
+-- did not prevent health loss, because that method is not where health changes.
+--
+-- @return userdata|nil
+function M.health_info()
+  local controller = M.damage_controller()
+  if controller == nil then
+    -- Fall back to the player status, which may expose the same accessor
+    -- through a different inheritance route.
+    controller = M.player_status()
+    if controller == nil then
+      return nil
+    end
+  end
+
+  local info = objects.call(controller, "getHealthInfo")
+  if info == nil then
+    info = objects.get(controller, "HealthInfo")
+  end
+
+  if info == nil or not objects.is_valid(info) then
+    return nil
+  end
+
+  return info
+end
+
+--- Write the player's health directly.
+--
+-- app.HealthInfo carries a plain writable `Health` float and a set_health(float)
+-- accessor, both confirmed present in the discovery dump. This exists because
+-- hooking the damage path proved unreliable in practice, while reading and
+-- writing the value does not.
+--
+-- @param value number
+-- @return boolean ok
+function M.set_health(value)
+  local info = M.health_info()
+  if info == nil then
+    return false
+  end
+
+  local ok, result = safe.call_method(info, "set_health", value)
+  if ok and result ~= nil then
+    return true
+  end
+
+  -- Fall back to writing the field directly.
+  return objects.set(info, "Health", value)
+end
+
 --- Is the player dead, according to the game?
 -- @return boolean|nil
 function M.is_dead()
@@ -321,6 +382,58 @@ function M.gun_ammo(gun)
     magazine_max = safe.to_number(objects.call(gun, "get_maxLoadNum")),
     reserve = safe.to_number(objects.call(gun, "get_bulletStackNum")),
   }
+end
+
+--- Write a gun's magazine count.
+--
+-- set_loadNum is the method the game itself calls to change the magazine.
+-- Confirmed in game: emptying a magazine and reloading produced six
+-- set_loadNum calls. Note that expendBullet, which the first implementation
+-- hooked, never fired at all -- it is not on the firing path in this build.
+--
+-- @param value number
+-- @param gun userdata|nil defaults to the equipped gun
+-- @return boolean ok
+function M.set_magazine(value, gun)
+  gun = gun or M.equipped_gun()
+  if gun == nil then
+    return false
+  end
+
+  local ok, result = safe.call_method(gun, "set_loadNum", value)
+  return ok and result ~= nil
+end
+
+--- Write an item's stack count.
+-- @param item userdata app.Item
+-- @param value number
+-- @return boolean ok
+function M.set_item_stack(item, value)
+  if item == nil then
+    return false
+  end
+
+  local ok, result = safe.call_method(item, "setStackNum", value)
+  if ok and result ~= nil then
+    return true
+  end
+
+  return objects.set(item, "ItemStackNum", value)
+end
+
+--- An item's current stack count, or nil.
+-- @param item userdata app.Item
+-- @return number|nil
+function M.item_stack(item)
+  if item == nil then
+    return nil
+  end
+
+  local value = safe.to_number(objects.call(item, "getStackNum"))
+  if value ~= nil then
+    return value
+  end
+  return safe.to_number(objects.get(item, "ItemStackNum"))
 end
 
 return M

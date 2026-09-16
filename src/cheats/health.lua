@@ -1,48 +1,55 @@
 --[[--------------------------------------------------------------------------
   re7trainer.cheats.health — Infinite Health / God Mode.
 
-  THE API THIS USES IS REAL AND WAS READ OUT OF THE RUNNING GAME
-  --------------------------------------------------------------
-  From a live discovery dump (docs/DISCOVERY_RESULTS.md):
+  WHY THIS DOES NOT USE A HOOK
+  ----------------------------
+  The first implementation hooked app.PlayerDamageController.doDamage and
+  skipped it. In game, the method was confirmed to fire (a counting probe
+  recorded it once per hit) and skipping it did NOT prevent health loss.
 
-      app.PlayerDamageController
-        M System.Void doDamage(? (1 params))
+  The reason, from the discovery dump: app.PlayerDamageController derives from
+  app.DamageController, and it is the BASE class that carries the health record:
 
-  `doDamage` takes exactly one parameter, which means a hook that suppresses it
-  needs no parameter handling at all — returning SKIP_ORIGINAL is sufficient.
+      app.DamageController
+        F app.HealthInfo HealthInfo
+        M app.HealthInfo getHealthInfo()
+        M System.Void    adjustHealth(?)
+        M System.Void    recoveryHealth(?) / recoveryHealthAll(?)
 
-  STRATEGY (the project's preferred one, in its stated order)
-  -----------------------------------------------------------
-  Prevent damage at the source rather than rewriting a value afterwards:
+  doDamage on the subclass is reaction and animation work, not the health
+  write. Healing has its own separate methods, so adjustHealth is the damage
+  path -- but its argument is a float we cannot reliably read from a hook
+  argument table, and getting that wrong would silently block healing instead.
 
-      sdk.hook(doDamage, pre = SKIP_ORIGINAL when enabled, post = nil)
+  So this uses the approach that is verifiable end to end: read the value, and
+  put it back. Both halves are confirmed working in game -- health read as
+  960/1000 live, and app.HealthInfo exposes a writable `Health` float plus
+  set_health(float).
 
-  Nothing else in the game is affected. Enemies still take damage, healing still
-  works, the damage-animation path is simply never entered. Because the health
-  value is never written by us, there is no window in which a wrong value is
-  visible, and there is no risk of clobbering a legitimate healing event.
+  HOW THE RESTORE WORKS
+  ---------------------
+  Track the last observed value each frame. If it DROPS, write the old value
+  back. If it RISES, accept the new value.
 
-  THE HOOK IS PERMANENT. THE FLAG IS NOT.
-  ---------------------------------------
-  This build has no unhook and no remove_hook (both confirmed absent from the
-  installed binary). Once installed the hook stays for the life of the process.
-  So disabling this cheat does NOT remove the hook — it flips `enabled`, which
-  the callback reads before deciding whether to skip. The callback therefore
-  has to be correct while disabled, which is why it checks the flag first and
-  returns immediately.
+  The rise case matters: healing, pickups and story events all legitimately
+  increase health, and a naive "set it to maximum every frame" would fight them
+  and could leave the player permanently pinned at a value the game does not
+  expect. Only decreases are undone.
 
-  A SECOND, SOFTER OPTION EXISTS
-  ------------------------------
-  app.CharacterCommonStatus (inherited by app.PlayerStatus) exposes a writable
-  `set_isForbidDamageReaction(System.Boolean)`. It is not used by default
-  because it is NOT PROVEN to prevent health loss — the name suggests it may
-  govern only the reaction animation while the health value still drops. It is
-  exposed here as an explicit experiment rather than being silently relied on.
+  TRADE-OFF, STATED PLAINLY
+  -------------------------
+  This is the second of the three strategies the project specified, not the
+  first. Because the game applies the damage and we undo it on the next frame,
+  there is a window of up to one frame in which the HUD can show the reduced
+  value. The preferred "prevent it at the source" approach is not reachable
+  here: the only interception point the probe could confirm is not the health
+  write, and the actual write takes a float argument we cannot read reliably.
+  A one-frame HUD flicker is a much better outcome than a cheat that silently
+  does nothing, or a hook that corrupts memory.
 ----------------------------------------------------------------------------]]
 
 local logger = require("re7trainer.logger")
 local state = require("re7trainer.state")
-local safe = require("re7trainer.utils.safe_call")
 local game = require("re7trainer.game")
 
 local M = {}
@@ -50,17 +57,13 @@ local M = {}
 M.NAME = "health"
 M.LABEL = "Infinite Health / God Mode"
 
---- Read by the hook on every call. This, not the hook's existence, is what
---- enable/disable actually controls.
 local enabled = false
 
---- Whether the hook has been installed at least once.
-local hook_ready = false
+--- Health as of the previous frame. Nil until the first successful read.
+local baseline = nil
 
---- Optional secondary flag, off unless the user asks for the experiment.
-local use_damage_reaction_flag = false
-
-local HOOK_KEY = "app.PlayerDamageController.doDamage"
+--- How many times damage has been undone, for the debug panel.
+local restores = 0
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
@@ -68,20 +71,26 @@ local HOOK_KEY = "app.PlayerDamageController.doDamage"
 
 function M.initialize()
   enabled = false
-  use_damage_reaction_flag = false
+  baseline = nil
+  restores = 0
 
-  -- Confirm the target exists, but do not hook yet. Hooking is deferred to the
-  -- first enable() so that a player who never turns the cheat on never pays
-  -- any hook cost at all.
-  if safe.type_definition("app.PlayerDamageController") == nil then
-    state.mark_unsupported("health",
-      "app.PlayerDamageController is not present in this build")
-    logger.warn("Health", "Target type missing; Infinite Health will stay disabled.")
+  -- Confirm both halves of the mechanism exist before claiming support. A
+  -- cheat that can read but not write is not a cheat, and it should say so
+  -- rather than appear available.
+  if game.health() == nil then
+    state.mark_unsupported("health", "player health is not readable")
+    logger.warn("Health", "Cannot read health; Infinite Health will stay disabled.")
     return
   end
 
-  state.mark_supported("health", "app.PlayerDamageController.doDamage discovered")
-  logger.info("Health", "Ready. Hook target: app.PlayerDamageController.doDamage")
+  if game.health_info() == nil then
+    state.mark_unsupported("health", "app.HealthInfo is not reachable, so health cannot be written")
+    logger.warn("Health", "Cannot reach the writable health record; Infinite Health will stay disabled.")
+    return
+  end
+
+  state.mark_supported("health", "health is both readable and writable")
+  logger.info("Health", "Ready. Restoring health when it decreases.")
 end
 
 --- @return boolean
@@ -97,40 +106,7 @@ function M.status()
   if not enabled then
     return "ready (off)"
   end
-  return hook_ready and "active (damage suppressed at source)" or "enabling..."
-end
-
---- Install the hook if it is not already installed.
--- Safe to call repeatedly: safe_call.hook_method installs at most once per key.
--- @return boolean ok, string|nil detail
-local function ensure_hook()
-  if hook_ready then
-    return true, nil
-  end
-
-  local ok, detail = safe.hook_method(
-    HOOK_KEY,
-    "app.PlayerDamageController",
-    "doDamage",
-    function(args)
-      -- Runs on the game thread while holding the Lua lock. Keep it minimal.
-      -- The counter is the whole point of this being instrumented: if it stays
-      -- at zero while you are being hit, doDamage is not the method the game
-      -- calls to damage the player, and no amount of hooking it will help.
-      if not enabled or state.prefs.trainer_enabled ~= true then
-        safe.note_invocation(HOOK_KEY, "pass (disabled)")
-        return sdk.PreHookResult.CALL_ORIGINAL
-      end
-      safe.note_invocation(HOOK_KEY, "SKIP")
-      return sdk.PreHookResult.SKIP_ORIGINAL
-    end,
-    nil
-  )
-
-  if ok then
-    hook_ready = true
-  end
-  return ok, detail
+  return "active (" .. tostring(restores) .. " restored)"
 end
 
 --- @return boolean ok, string message
@@ -141,57 +117,65 @@ function M.enable()
     return false, reason
   end
 
-  local ok, detail = ensure_hook()
-  if not ok then
-    logger.error("Health", "Could not hook doDamage: " .. tostring(detail))
-    return false, tostring(detail)
-  end
-
+  -- Seed the baseline from the current value so the first frame after enabling
+  -- does not mistake a stale baseline for damage.
+  local health = game.health()
+  baseline = health and health.current or nil
   enabled = true
 
-  if use_damage_reaction_flag then
-    M.set_damage_reaction_forbidden(true)
-  end
-
-  logger.info("Health", "Enabled. Damage to the player is suppressed at the source.")
+  logger.info("Health", "Enabled. Health will be restored whenever it drops.")
   return true, nil
 end
 
---- Stop suppressing damage.
---
--- Note this does NOT remove the hook — it cannot, this build has no unhook.
--- It clears the flag the hook reads.
 function M.disable()
   enabled = false
-
-  if use_damage_reaction_flag then
-    M.set_damage_reaction_forbidden(false)
-  end
-
+  baseline = nil
   logger.info("Health", "Disabled. Normal damage behaviour restored.")
 end
 
 --- Per-frame work.
 --
--- Deliberately almost empty: damage suppression happens in the hook, at the
--- moment of the call, rather than by polling. The only work here is keeping the
--- UI readout current.
+-- Runs on the game thread via re.on_frame, which is why writing here is safe.
 function M.update()
   if not M.is_supported() then
     return
   end
 
-  -- Refresh the displayed value at a low rate. Reading health is cheap, but
-  -- doing it 60 times a second for a number the user cannot read that fast is
-  -- pointless work on the game thread.
-  if logger.frame() % 30 ~= 0 then
+  local health = game.health()
+  if health == nil then
+    -- Player object not available (menu, load, transition). Forget the
+    -- baseline rather than carrying a value across a boundary where it is
+    -- meaningless.
+    baseline = nil
     return
   end
 
-  local health = game.health()
-  if health ~= nil then
-    state.runtime.health_current = health.current
-    state.runtime.health_max = health.max
+  state.runtime.health_current = health.current
+  state.runtime.health_max = health.max
+
+  if not enabled or state.prefs.trainer_enabled ~= true then
+    baseline = health.current
+    return
+  end
+
+  if baseline == nil then
+    baseline = health.current
+    return
+  end
+
+  if health.current < baseline then
+    -- Damage was applied since the last frame. Put it back.
+    if game.set_health(baseline) then
+      restores = restores + 1
+      logger.throttled("health:restore", 300, "debug", "Health",
+                       string.format("Restored health %.1f -> %.1f", health.current, baseline))
+    else
+      logger.throttled("health:writefail", 600, "warn", "Health",
+                       "Detected damage but could not write health back.")
+    end
+  else
+    -- Same or higher: accept it, so healing and pickups are not undone.
+    baseline = health.current
   end
 end
 
@@ -206,55 +190,10 @@ function M.readout()
   }
 end
 
--- ---------------------------------------------------------------------------
--- Optional experiment: the damage-reaction flag
--- ---------------------------------------------------------------------------
-
---- Toggle app.CharacterCommonStatus.set_isForbidDamageReaction.
---
--- Exposed deliberately as an experiment rather than as the default. The method
--- name says "forbid damage REACTION", which may mean it suppresses the stagger
--- animation while the health value still drops. That has to be established by
--- observation, not by reading the name.
---
--- Call this, take a hit, and compare get_health() before and after. If health
--- holds, this is a strictly better mechanism than the hook, because it changes
--- no code path at all.
---
--- @param forbidden boolean
--- @return boolean ok
-function M.set_damage_reaction_forbidden(forbidden)
-  local status = game.player_status()
-  if status == nil then
-    logger.warn("Health", "Cannot set damage-reaction flag: player status unavailable.")
-    return false
-  end
-
-  local ok, result = safe.call_method(status, "set_isForbidDamageReaction", forbidden == true)
-  if not ok or result == nil then
-    logger.warn("Health", "set_isForbidDamageReaction call did not report success.")
-    return false
-  end
-
-  logger.info("Health", "isForbidDamageReaction set to " .. tostring(forbidden) .. ".")
-  return true
-end
-
---- Enable the experiment mode. Used by the developer UI.
--- @param on boolean
-function M.use_reaction_flag(on)
-  use_damage_reaction_flag = on == true
-  if enabled then
-    M.set_damage_reaction_forbidden(use_damage_reaction_flag)
-  end
-end
-
 function M.reset()
   enabled = false
-  use_damage_reaction_flag = false
-  -- hook_ready is intentionally NOT cleared: the hook cannot be uninstalled,
-  -- so forgetting that it exists would let a later enable() try to install a
-  -- second one on the same method.
+  baseline = nil
+  restores = 0
 end
 
 return M

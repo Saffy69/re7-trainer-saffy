@@ -1,59 +1,39 @@
 --[[--------------------------------------------------------------------------
   re7trainer.cheats.inventory — Infinite Items.
 
-  THE API THIS USES IS REAL AND WAS READ OUT OF THE RUNNING GAME
-  --------------------------------------------------------------
-  From a live discovery dump (docs/DISCOVERY_RESULTS.md):
+  WHAT THE IN-GAME PROBE ESTABLISHED
+  ----------------------------------
+  Consuming an item fired:
 
-      app.Item
-        M System.Int32  getStackNum()
-        M System.Void   setStackNum(System.Int32)
-        M System.Boolean reduceNum(? (2 params))   <-- consumption
-        M app.ItemData  get_ItemData()
+      app.Item.destroyItem          x1
+      app.Inventory.reduceItem      x1
 
-      app.ItemData
-        F app.Item.ItemCategoryType Category           <-- the classification
+  and app.Item.reduceNum -- which the first implementation hooked -- never
+  fired at all. So consumption does not go through the per-item decrement the
+  name suggested.
 
-      app.Item.ItemCategoryType
-        Drug  Material  Shell                          <-- conserve these
-        KeyItem  UsableKeyItem  DiscardableKeyItem     <-- NEVER touch these
-        Weapon  StackWeapon  File  Map  SupplyBox  OtherItem
+  THE TWO HALVES OF THIS CHEAT
+  ----------------------------
+  1. A HOOK on app.Item.destroyItem, skipped when the item's category is one of
+     the conservable ones. destroyItem takes no arguments, so `this` is
+     available at args[2] and the category can be read off it directly. This is
+     confirmed to be on the consumption path and confirmed to be callable,
+     which is more than could be said for the previous target.
 
-  THE SAFETY PRECONDITION IS THEREFORE SATISFIABLE
-  ------------------------------------------------
-  This project set a hard rule: Infinite Items must not be enabled unless the
-  trainer can reliably tell a stackable consumable from a key item. The engine's
-  own category enum provides exactly that distinction, so the rule is met with
-  real game data rather than with a heuristic over item names.
+  2. A per-frame RESTORE of stack counts, for items that lose a unit without
+     being destroyed outright.
 
-  THE GATE IS ON EVERY SINGLE CALL
-  --------------------------------
-  The hook reads the category of the specific item being consumed and only
-  suppresses the consumption when that category is in game.SAFE_CATEGORIES. It
-  is not a global switch that happens to be safe most of the time -- a key item
-  passing through the same method still gets consumed normally.
+  Both are needed. The hook alone would leave a stack decremented but present;
+  the restore alone could not resurrect an item that had already been removed
+  from the inventory, which is exactly what happened in the first in-game test.
 
-  This matters because RE7 key items gate puzzles. Duplicating one can make a
-  run unrecoverable, and unlike a wrong health value that is not a state you can
-  simply undo.
-
-  FAIL CLOSED
-  -----------
-  If the category cannot be read for any reason, the item is treated as unsafe
-  and the consumption proceeds normally. An unreadable category is precisely the
-  case where a guess could touch a key item.
-
-  THE HOOK IS PERMANENT. THE FLAG IS NOT.
-  ---------------------------------------
-  No unhook exists in this build, so the hook stays installed and a flag decides
-  whether it does anything.
-
-  WHAT IS DELIBERATELY NOT DONE
-  -----------------------------
-  No eager "restore every item every frame" loop. Such a loop would also undo
-  legitimate removals -- combining two herbs into one stronger herb, handing an
-  item to an NPC, dropping something -- and could break progression in ways that
-  are hard to diagnose. Only the consumption of a safe item is prevented.
+  THE SAFETY GATE IS UNCHANGED AND APPLIES TO BOTH HALVES
+  -------------------------------------------------------
+  Only Drug, Material and Shell are ever conserved. Key items -- KeyItem,
+  UsableKeyItem, DiscardableKeyItem -- are consumed normally even while the
+  cheat is on, because duplicating one can make a run unrecoverable. If a
+  category cannot be read, the item is treated as unsafe and nothing is done to
+  it. Both the hook and the restore path call the same gate.
 ----------------------------------------------------------------------------]]
 
 local logger = require("re7trainer.logger")
@@ -67,15 +47,16 @@ local M = {}
 M.NAME = "inventory"
 M.LABEL = "Infinite Items"
 
---- Read by the hook on every call.
-local enabled = false
+local HOOK_KEY = "app.Item.destroyItem"
 
+local enabled = false
 local hook_ready = false
 
-local HOOK_KEY = "app.Item.reduceNum"
+--- itemDataID -> last observed stack count.
+local baseline = {}
 
---- Number of consumptions suppressed, for the debug panel. Purely diagnostic.
-local suppressed = 0
+local restores = 0
+local blocks = 0
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
@@ -83,17 +64,16 @@ local suppressed = 0
 
 function M.initialize()
   enabled = false
-  suppressed = 0
+  hook_ready = false
+  baseline = {}
+  restores = 0
+  blocks = 0
 
   if safe.type_definition("app.Item") == nil then
     state.mark_unsupported("inventory", "app.Item is not present in this build")
-    logger.warn("Inventory", "Target type missing; Infinite Items will stay disabled.")
     return
   end
 
-  -- The category gate is the precondition. Confirm the enum is reachable before
-  -- claiming support -- if the category cannot be read, this cheat must not run
-  -- at all, so that is checked here rather than discovered at consumption time.
   if safe.type_definition("app.ItemData") == nil then
     state.mark_unsupported("inventory",
       "app.ItemData missing, so item categories cannot be read safely")
@@ -102,8 +82,8 @@ function M.initialize()
   end
 
   state.mark_supported("inventory",
-    "app.ItemData.Category provides engine-level consumable/key-item classification")
-  logger.info("Inventory", "Ready. Hook target: app.Item.reduceNum, gated on item category.")
+    "item categories are readable, so consumables can be told from key items")
+  logger.info("Inventory", "Ready. Guarding destroyItem and restoring stack counts.")
 end
 
 --- @return boolean
@@ -119,21 +99,15 @@ function M.status()
   if not enabled then
     return "ready (off)"
   end
-  return "active (safe categories only, " .. tostring(suppressed) .. " suppressed)"
+  return string.format("active (%d blocked, %d restored)", blocks, restores)
 end
 
---- The hook body.
+--- The destroyItem hook.
 --
 -- args layout, from the verified sdk.hook signature:
---   args[1] = REThreadContext*
---   args[2] = `this`  (the app.Item being consumed)
---   args[3..] = parameters
+--   args[1] = REThreadContext*, args[2] = `this` (the app.Item)
 -- @param args table
-local function on_reduce_num(args)
-  -- Runs on the game thread holding the Lua lock, so the cheapest possible
-  -- early-outs come first. The counter records every call, including the ones
-  -- that pass through, so "reduceNum is not the consumption path" can be told
-  -- apart from "the hook is gating wrong".
+local function on_destroy_item(args)
   if not enabled or state.prefs.trainer_enabled ~= true then
     safe.note_invocation(HOOK_KEY, "pass (disabled)")
     return sdk.PreHookResult.CALL_ORIGINAL
@@ -145,21 +119,14 @@ local function on_reduce_num(args)
     return sdk.PreHookResult.CALL_ORIGINAL
   end
 
-  -- The gate. Everything hinges on this call: it reads the engine's own
-  -- category for THIS item and refuses anything that is not a known
-  -- consumable. A key item reaching here is consumed exactly as normal.
   local item_safe, reason = game.is_safe_to_conserve(item)
   if not item_safe then
-    -- Logged at a throttled rate -- an item consumed repeatedly while
-    -- unclassified would otherwise flood the log.
-    logger.throttled("inv:skip:" .. tostring(reason), 600, "debug", "Inventory",
-                     "Not conserving: " .. tostring(reason))
     safe.note_invocation(HOOK_KEY, "pass (" .. tostring(reason) .. ")")
     return sdk.PreHookResult.CALL_ORIGINAL
   end
 
-  suppressed = suppressed + 1
-  safe.note_invocation(HOOK_KEY, "SKIP (" .. tostring(reason) .. ")")
+  blocks = blocks + 1
+  safe.note_invocation(HOOK_KEY, "SKIP (destroy blocked)")
   return sdk.PreHookResult.SKIP_ORIGINAL
 end
 
@@ -169,7 +136,7 @@ local function ensure_hook()
   end
 
   local ok, detail = safe.hook_method(
-    HOOK_KEY, "app.Item", "reduceNum", on_reduce_num, nil)
+    HOOK_KEY, "app.Item", "destroyItem", on_destroy_item, nil)
 
   if ok then
     hook_ready = true
@@ -187,41 +154,97 @@ function M.enable()
 
   local ok, detail = ensure_hook()
   if not ok then
-    -- Do not report success when the hook failed. The previous version of this
-    -- module refused enabling outright; now that there is a real implementation,
-    -- the equivalent guarantee is that a failed hook is a failed enable.
-    logger.error("Inventory", "Could not hook reduceNum: " .. tostring(detail))
+    logger.error("Inventory", "Could not hook destroyItem: " .. tostring(detail))
     return false, tostring(detail)
   end
 
   enabled = true
-  logger.info("Inventory", "Enabled. Consumption of Drug/Material/Shell items is suppressed.")
+  M.refresh_baseline()
+  logger.info("Inventory", "Enabled. Drug/Material/Shell items will not be consumed.")
   return true, nil
 end
 
---- Stop suppressing consumption. Does not remove the hook.
 function M.disable()
   enabled = false
+  baseline = {}
   logger.info("Inventory", "Disabled. Normal item consumption restored.")
 end
 
---- Per-frame work: refresh the readout only.
+-- ---------------------------------------------------------------------------
+-- Stack tracking
+-- ---------------------------------------------------------------------------
+
+--- Record the current stack count of every conservable item.
+local function refresh_baseline()
+  baseline = {}
+
+  for _, info in ipairs(game.item_infos()) do
+    local item = objects.get(info, "Item")
+    if item ~= nil and game.is_safe_to_conserve(item) then
+      local id = objects.get(item, "ItemDataID")
+      local count = game.item_stack(item)
+      if type(id) == "string" and count ~= nil then
+        baseline[id] = count
+      end
+    end
+  end
+end
+
+M.refresh_baseline = refresh_baseline
+
+--- Per-frame work: put back any stack that lost a unit.
 function M.update()
   if not M.is_supported() then
     return
   end
-  if logger.frame() % 60 ~= 0 then
+
+  local infos = game.item_infos()
+  if #infos == 0 then
     return
   end
 
-  -- count_safe_items walks the inventory, which is more expensive than the
-  -- other cheats' readouts, so it runs at a quarter of their rate.
-  local safe_count, total = game.count_safe_items()
-  state.runtime.item_count = safe_count
-  if total > 0 then
-    logger.throttled("inv:survey", 1800, "debug", "Inventory",
-                     string.format("%d of %d carried items are conservable.", safe_count, total))
+  if not enabled or state.prefs.trainer_enabled ~= true then
+    refresh_baseline()
+    return
   end
+
+  local safe_seen = 0
+  local tracked = 0
+
+  for _, info in ipairs(infos) do
+    local item = objects.get(info, "Item")
+    if item ~= nil then
+      tracked = tracked + 1
+
+      local is_safe, _ = game.is_safe_to_conserve(item)
+      if is_safe then
+        safe_seen = safe_seen + 1
+
+        local id = objects.get(item, "ItemDataID")
+        local count = game.item_stack(item)
+
+        if type(id) == "string" and count ~= nil then
+          local previous = baseline[id]
+
+          if previous == nil then
+            baseline[id] = count
+          elseif count < previous then
+            if game.set_item_stack(item, previous) then
+              restores = restores + 1
+            end
+          else
+            -- Same or higher: a pickup or a combine result. Accept it.
+            baseline[id] = count
+          end
+        end
+      end
+    end
+  end
+
+  state.runtime.item_count = safe_seen
+
+  logger.throttled("inv:survey", 1800, "debug", "Inventory",
+                   string.format("%d of %d carried items are conservable.", safe_seen, tracked))
 end
 
 --- @return table|nil
@@ -232,24 +255,13 @@ function M.readout()
   return { current = state.runtime.item_count }
 end
 
---- Enable the alternative consumption path.
---
--- app.Item.reduceNum is the clear decrement operation and is the default. If
--- testing shows that consuming a herb does not go through it, app.Item.useItem
--- is the other candidate. This exists so that switching is a one-line change
--- during testing rather than a code edit.
---
--- Not wired to the UI yet: the correct hook point should be established by
--- observation first, not offered as a choice the user has to guess at.
--- @return string name of the method currently hooked
-function M.hooked_method()
-  return "reduceNum"
-end
-
 function M.reset()
   enabled = false
-  suppressed = 0
-  -- hook_ready not cleared; the hook is permanent.
+  baseline = {}
+  restores = 0
+  blocks = 0
+  -- hook_ready is not cleared: the hook is permanent in this build, so a later
+  -- enable() must not try to install a second one.
 end
 
 return M
