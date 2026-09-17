@@ -40,17 +40,25 @@ WINEDLLOVERRIDES="dinput8.dll=n,b" %command%
 
 ---
 
-## The menu appears but the cheats are all disabled
+## The menu appears but a cheat toggle is greyed out
 
-**This is expected and correct.** The cheats are not implemented yet — the game API has not been
-discovered. Each disabled toggle states its specific reason.
+A greyed toggle is not a bug — it is the UI refusing to offer a switch that would silently do
+nothing. The line carries the **specific reason**, and the reason names what to check.
 
-Run the discovery dump to move this forward: **Developer → Run discovery dump**, from inside
-gameplay. Then see [DISCOVERY.md](DISCOVERY.md).
+The common ones:
 
-If you want to confirm the framework is alive independently of the cheats, open
-**Developer → Debug Mode** and check that `SDK available` reads `true` and the frame counter is
-advancing.
+| Reason | What it means |
+|---|---|
+| `app.Item is not present in this build` | Your game build's type database differs from the one this was written against. See [COMPATIBILITY.md](COMPATIBILITY.md); nothing will work until the routes are re-derived against a dump from your build. |
+| `app.ItemData missing, so item categories cannot be read safely` | Same class of problem, for Infinite Items specifically. The gate fails closed rather than guessing. |
+| `no inventory readable yet -- load into gameplay and try again` | You are in the main menu. Load a save; game objects do not exist until you are in gameplay. |
+| `none of the N carried items can be classified as a consumable` | You are in gameplay and the inventory reads, but nothing you carry is in a conserved category. Pick up an herb or some ammo and try again — or widen the categories from **Developer → Conserved categories**. |
+
+To confirm the framework is alive independently of the cheats, open **Developer → Debug Mode** and
+check that `SDK available` reads `true` and the frame counter is advancing.
+
+If the build is genuinely mismatched, **Developer → Run discovery dump** (from inside gameplay) is
+how a fresh set of routes gets derived. See [DISCOVERY.md](DISCOVERY.md).
 
 ---
 
@@ -160,10 +168,13 @@ convenience, and the UI is the supported path.
 Note also that a hotkey for a **disabled** cheat does nothing but log:
 
 ```
-God Mode hotkey ignored: not yet discovered
+God Mode hotkey ignored: app.HealthInfo is not present in this build
 ```
 
-This is deliberate. Hotkeys route through the same `enable()` path the checkbox uses, so a hotkey
+The trailing reason is the same string the menu shows on the greyed toggle, so the log and the UI
+never disagree about why something is unavailable.
+
+That is deliberate. Hotkeys route through the same `enable()` path the checkbox uses, so a hotkey
 can never enable something the UI would have refused.
 
 ---

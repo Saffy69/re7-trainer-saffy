@@ -296,8 +296,9 @@ For any subsystem whose expected types are missing, the toggle renders as:
 [ ] Infinite Health / God Mode  -- <reason>
 ```
 
-rather than as a switch. The reason string is the specific failure — `"not yet discovered"`,
-`"the expected types are not present in this build"` — not a generic message.
+rather than as a switch. The reason string is the specific failure — `"app.Item is not present in
+this build"`, `"no inventory readable yet -- load into gameplay and try again"` — not a generic
+message.
 
 ---
 
