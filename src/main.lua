@@ -47,7 +47,7 @@ local objects = require("re7trainer.utils.object_helpers")
 
 local M = {}
 
-M.VERSION = "0.1.0"
+M.VERSION = "0.2.0"
 
 --- Virtual key codes for the hotkeys.
 -- F6/F7/F8 are 0x75/0x76/0x77 in the Windows VK scheme.
@@ -199,13 +199,36 @@ local function initialize()
 
   state.runtime.initialized = true
 
-  -- Say plainly what state we are in. This is the "unsupported/undiscovered
-  -- game build" message the project requires, and it is emitted once.
+  -- Say plainly what state we are in. This is the "unsupported game build"
+  -- message the project requires, and it is emitted once.
+  --
+  -- It reports which subsystems failed, rather than asserting that everything
+  -- is fine. At this point only the type checks have run -- initialize() is not
+  -- allowed to touch live objects -- so a subsystem that passed here can still
+  -- refuse later at enable() time, and the message must not promise otherwise.
   if not announced then
     announced = true
-    logger.info(nil, "No cheat is functional yet: health, ammo and inventory APIs have "
-                  .. "not been discovered. Open the Developer section and run a discovery "
-                  .. "dump from inside gameplay.")
+
+    local unavailable = {}
+    for _, entry in ipairs({
+      { "health", state.runtime.health_supported, state.runtime.health_reason },
+      { "ammo", state.runtime.ammo_supported, state.runtime.ammo_reason },
+      { "inventory", state.runtime.inventory_supported, state.runtime.inventory_reason },
+    }) do
+      if entry[2] ~= true then
+        unavailable[#unavailable + 1] = string.format("%s (%s)", entry[1], tostring(entry[3]))
+      end
+    end
+
+    if #unavailable == 0 then
+      logger.info(nil, "All three cheats are available on this build. They stay off "
+                    .. "until you enable them; each one validates itself against the "
+                    .. "live game the first time it is switched on.")
+    else
+      logger.warn(nil, string.format(
+        "These subsystems are NOT available on this build, and their toggles will "
+        .. "be disabled: %s. The rest are available.", table.concat(unavailable, "; ")))
+    end
   end
 end
 

@@ -23,8 +23,8 @@
   -------
   The keyboard bindings are real (imgui.is_key_pressed is present in this
   build) but they only ever drive toggles that are already enabled. Pressing F6
-  on a build where health has not been discovered does nothing and says so in
-  the log — it does not force the flag on.
+  on a build where a cheat cannot run does nothing and says so in the log — it
+  does not force the flag on.
 ----------------------------------------------------------------------------]]
 
 local W = require("re7trainer.utils.imgui_safe")
@@ -87,7 +87,7 @@ local function draw_cheat(label, pref_key, subsystem, cheat)
 
   if not supported then
     -- Not discovered: show why, and do not offer a live checkbox.
-    W.button_disabled(label, state.runtime[subsystem .. "_reason"] or "not yet discovered")
+    W.button_disabled(label, state.runtime[subsystem .. "_reason"] or "not yet checked")
     return
   end
 
@@ -204,7 +204,13 @@ function M.draw()
   local inventory = require("re7trainer.cheats.inventory")
 
   W.text("RE7 Personal Trainer")
-  W.text("v0.1.0 -- discovery build")
+
+  -- The version is read lazily and defensively. menu.lua is loaded BY main.lua,
+  -- so requiring it at file scope would be a circular require that yields a
+  -- half-built module; by the time draw() runs, main is complete. The pcall is
+  -- because this panel must never be the thing that breaks.
+  local ok, main = pcall(require, "re7trainer.main")
+  W.text("v" .. tostring(ok and main.VERSION or "unknown"))
   W.separator()
 
   -- Master switch. Turning this off disables every cheat without losing the

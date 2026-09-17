@@ -47,11 +47,11 @@ M.runtime = {
   -- Per-subsystem discovery status. Both must be true before the matching
   -- cheat will enable: something was found, AND we can act on it.
   health_supported    = false,
-  health_reason       = "not yet discovered",
+  health_reason       = "not yet checked",
   ammo_supported      = false,
-  ammo_reason         = "not yet discovered",
+  ammo_reason         = "not yet checked",
   inventory_supported = false,
-  inventory_reason    = "not yet discovered",
+  inventory_reason    = "not yet checked",
 
   -- Live values captured by the probes, for display only. These are numbers,
   -- never object references, so they are safe to keep across frames.
@@ -109,11 +109,11 @@ function M.reset_runtime()
   M.runtime.init_error        = nil
   M.runtime.game_ready        = false
   M.runtime.health_supported  = false
-  M.runtime.health_reason     = "not yet discovered"
+  M.runtime.health_reason     = "not yet checked"
   M.runtime.ammo_supported    = false
-  M.runtime.ammo_reason       = "not yet discovered"
+  M.runtime.ammo_reason       = "not yet checked"
   M.runtime.inventory_supported = false
-  M.runtime.inventory_reason  = "not yet discovered"
+  M.runtime.inventory_reason  = "not yet checked"
   M.runtime.health_current    = nil
   M.runtime.health_max        = nil
   M.runtime.ammo_current      = nil
