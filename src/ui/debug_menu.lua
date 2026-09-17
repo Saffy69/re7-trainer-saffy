@@ -197,7 +197,7 @@ local function draw_game_access()
   -- state is shown explicitly rather than implied by the toggle being live.
   local safe_count, total = game.count_safe_items()
   W.field("  items conservable", string.format("%d of %d", safe_count, total))
-  W.muted("only Drug / Material / Shell are ever conserved")
+  W.muted("Drug / Material / Shell by default - see Conserved categories below")
 
   W.field("  hooks installed", tostring(safe.hook_count()))
 end
@@ -364,6 +364,62 @@ local function draw_item_classification()
   end
 end
 
+--- Draw the conserved-category controls.
+--
+-- The gate is an allowlist of category VALUES, and only five of them were ever
+-- established: 1 Weapon, 2 Shell, 3 Drug, 4 KeyItem, 7 Material. The rest
+-- could not be derived -- the enum's members sort alphabetically in a
+-- reflection listing, so names cannot be paired with numbers by position, and
+-- the numbers had to be observed one at a time.
+--
+-- So this lists the values that are actually in the inventory right now, with
+-- what each contains, and lets one be opted into from here. That is the
+-- difference between "add a category" being a guess made in a source file and
+-- a decision made by the person looking at the items.
+--
+-- Nothing beyond the three defaults is on unless it is ticked. Widening this
+-- has a save-file consequence, so it is deliberately not the default state.
+local function draw_category_controls()
+  local game = require("re7trainer.game")
+
+  W.spacing()
+  W.text("Conserved categories")
+  W.muted("only ticked values are conserved; everything else is left alone")
+
+  local observed = game.observed_categories()
+  if #observed == 0 then
+    W.muted("  nothing readable yet -- be in gameplay with items carried")
+    return
+  end
+
+  for _, entry in ipairs(observed) do
+    local label = string.format("conserve value %d  (%d item%s%s)",
+                                entry.value,
+                                entry.count,
+                                entry.count == 1 and "" or "s",
+                                entry.sample ~= nil and (", e.g. " .. entry.sample) or "")
+
+    if game.is_category_default(entry.value) then
+      -- A default. Shown but not switchable: turning one off would silently
+      -- stop the cheat working for the items it was built for.
+      W.field("  " .. label, "always on")
+    else
+      local changed, value = W.checkbox(label, game.is_category_opted_in(entry.value))
+      if changed then
+        game.set_category_conserved(entry.value, value)
+        logger.info("Inventory", string.format(
+          "Category value %d is now %s%s.",
+          entry.value,
+          value and "conserved" or "left alone",
+          entry.sample ~= nil and (" (e.g. " .. entry.sample .. ")") or ""))
+      end
+    end
+  end
+
+  W.muted("key, quest and weapon items stay off unless you tick them")
+  W.muted("conserving what the game removes on purpose can stall a run")
+end
+
 --- Draw what is reachable on the equipped weapon.
 --
 -- The ammo cheat reported "CurrentBulletInfo unreachable" while get_loadNum()
@@ -423,6 +479,7 @@ function M.draw()
   draw_game_access()
   draw_gun_access()
   draw_item_classification()
+  draw_category_controls()
   draw_hooks()
   draw_hook_probe()
   draw_candidates()

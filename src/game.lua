@@ -317,6 +317,78 @@ M.SAFE_CATEGORIES = {
   Shell = true,
 }
 
+--- Category values the user has opted into, beyond the three defaults.
+--
+-- RUNTIME ONLY, never persisted. A category that was conservable last session
+-- is not a fact about this one, and a stale allowlist is exactly the kind of
+-- hidden state that makes a trainer behave in ways its owner cannot explain.
+--
+-- THE GATE IS STILL AN ALLOWLIST, and this is the only way a category becomes
+-- conservable on top of the three defaults. A value that is not in here and
+-- not a default stays untouchable -- so a category this build has that the
+-- discovery dump never showed is still refused rather than swept up.
+--
+-- What this is for: the dump established values 1, 2, 3, 4 and 7. It did NOT
+-- establish 5, 6, 8 or anything above, because the enum's members sort
+-- alphabetically in a reflection listing and the numbers had to be observed
+-- rather than derived. This lets an observed value be added live, from the
+-- inventory in front of the player, instead of being guessed at here.
+local extra_conserved = {}
+
+--- Is this category value conserved, by default or by choice?
+-- @param value number|nil
+-- @return boolean
+function M.category_conserved(value)
+  if type(value) ~= "number" then
+    return false
+  end
+  if M.SAFE_CATEGORY_VALUES[value] ~= nil then
+    return true
+  end
+  return extra_conserved[value] == true
+end
+
+--- Is this value conserved because the user opted in, rather than by default?
+-- Used by the panel to render the control's state.
+-- @param value number
+-- @return boolean
+function M.is_category_opted_in(value)
+  return extra_conserved[value] == true
+end
+
+--- Is this value one of the three defaults, which cannot be switched off?
+-- @param value number
+-- @return boolean
+function M.is_category_default(value)
+  return M.SAFE_CATEGORY_VALUES[value] ~= nil
+end
+
+--- Add or remove a category value from the conserved set.
+--
+-- The defaults cannot be switched off from here. Turning Shell off would make
+-- Infinite Ammo's item-side counterpart silently stop working for the items it
+-- was built for, which is the "switch that does nothing" failure this project
+-- is arranged against. Opting a category IN is additive only.
+--
+-- @param value number
+-- @param on boolean
+-- @return boolean accepted
+function M.set_category_conserved(value, on)
+  if type(value) ~= "number" then
+    return false
+  end
+  if M.SAFE_CATEGORY_VALUES[value] ~= nil then
+    return false
+  end
+
+  if on == true then
+    extra_conserved[value] = true
+  else
+    extra_conserved[value] = nil
+  end
+  return true
+end
+
 --- The carried items, as a plain Lua array of app.Inventory.ItemInfo.
 --
 -- Two accessors are tried, because the first one returned nothing in game even
@@ -436,6 +508,12 @@ function M.is_safe_to_conserve(item)
     if name ~= nil then
       return true, name .. " (value " .. tostring(numeric) .. ")"
     end
+    if M.is_category_opted_in(numeric) then
+      -- Chosen by the player from the panel, after seeing which items are in
+      -- it. Recorded as such so the debug panel says WHY an item is conserved
+      -- rather than implying the default set covers it.
+      return true, "category value " .. tostring(numeric) .. " (opted in)"
+    end
     return false, "category value " .. tostring(numeric) .. " is not conservable"
   end
 
@@ -465,6 +543,54 @@ function M.is_safe_to_conserve(item)
   end
 
   return false, "does not stack (max " .. tostring(max_stack) .. ") -- treating as a key item"
+end
+
+--- Every item category currently present in the inventory, for the panel.
+--
+-- This is what makes opting a category in possible without guessing: it
+-- reports the values actually in front of the player, alongside one of the
+-- items each came from, so a value is chosen with its contents visible.
+--
+-- Only NUMERIC categories are reported. A build that surfaces the enum as a
+-- string is already covered by SAFE_CATEGORIES, and there is nothing useful to
+-- opt into for a category that reads as a name.
+--
+-- @return table array of { value = number, count = number, sample = string|nil }
+function M.observed_categories()
+  local counts, samples, order = {}, {}, {}
+
+  for _, info in ipairs(M.item_infos()) do
+    local item = objects.get(info, "Item")
+    if item ~= nil then
+      local _, _, numeric = M.item_category(item)
+      if numeric ~= nil then
+        if counts[numeric] == nil then
+          counts[numeric] = 0
+          order[#order + 1] = numeric
+        end
+        counts[numeric] = counts[numeric] + 1
+
+        if samples[numeric] == nil then
+          local id = objects.get(item, "ItemDataID")
+          if type(id) == "string" then
+            samples[numeric] = id
+          end
+        end
+      end
+    end
+  end
+
+  table.sort(order)
+
+  local out = {}
+  for _, value in ipairs(order) do
+    out[#out + 1] = {
+      value = value,
+      count = counts[value],
+      sample = samples[value],
+    }
+  end
+  return out
 end
 
 --- How many items are currently classified as safe to conserve.
@@ -730,27 +856,84 @@ function M.item_stack(item)
   return safe.to_number(objects.get(item, "ItemStackNum"))
 end
 
+--- Does this text look like an RE Engine item identifier?
+--
+-- THE BUG THIS REPLACES
+-- ---------------------
+-- The first version tested for things a sol2 pointer *might* render as --
+-- text containing "userdata", or text starting with "0x" -- rather than for
+-- what an identifier actually looks like. Neither guess was what this build
+-- produces, which is:
+--
+--     sol.REManagedObject*: 000000010BB92698
+--
+-- That passed the check, was returned as the item id, and -- because
+-- read_managed_string returns on the first route that succeeds -- the
+-- ToString routes underneath were never reached even once. In game every
+-- call reported:
+--
+--     reduceItem args: sol.REManagedObject*: 000000010BB92698 (not in inventory)
+--
+-- and passed through. Nothing was ever blocked, and no route that could have
+-- worked was ever tried.
+--
+-- So the test is now POSITIVE. Item ids in this game are short ASCII
+-- identifiers -- ChemicalM, RemedyM, AntiqueCoin, HandgunBullet -- and
+-- anything that is not that shape is rejected. A negative test against one
+-- build's pointer formatting is a guess that fails silently; this one fails
+-- visibly, by leaving the later routes to run.
+--
+-- @param text any
+-- @return boolean
+local function looks_like_item_id(text)
+  if type(text) ~= "string" then
+    return false
+  end
+  if #text == 0 or #text > 96 then
+    return false
+  end
+  -- A hex address literal. This is how a pointer is rendered in some builds,
+  -- and it is pure alphanumerics, so the identifier rule below would accept
+  -- it. No item id in this game has that shape, and accepting one puts us
+  -- straight back into the failure this function exists to prevent.
+  if text:match("^0x%x+$") ~= nil then
+    return false
+  end
+  return text:match("^%w[%w_]*$") ~= nil
+end
+
+M.looks_like_item_id = looks_like_item_id
+
 --- Read a managed System.String as a Lua string, or nil.
 --
 -- A hook parameter arriving as a managed string is not a Lua string -- it is a
 -- pointer to a managed object. REFramework may or may not surface its text
--- through any given accessor, and which one works cannot be reasoned out, so
--- every plausible route is tried and the caller is told which succeeded.
+-- through any given accessor, and which one works cannot be reasoned out
+-- offline, so every plausible route is tried in turn and the caller is told
+-- which one succeeded.
 --
 -- This matters because app.Inventory.reduceItem receives the item id as
 -- System.String in args[3]; without being able to read it, that call cannot be
 -- gated on which item is being consumed.
 --
+-- EVERY route's result is collected, not just the first failure. "Could not be
+-- rendered" was previously reported with no indication of what each route
+-- actually returned, which made the one question that mattered -- did the
+-- pointer arrive, and what came out of it -- unanswerable from the panel.
+--
 -- @param value any
 -- @return string|nil
--- @return string how it was read, for diagnostics
+-- @return string how it was read, or every route tried and what it yielded
 function M.read_managed_string(value)
   if value == nil then
     return nil, "nil"
   end
 
   if type(value) == "string" then
-    return value, "already a Lua string"
+    if looks_like_item_id(value) then
+      return value, "already a Lua string"
+    end
+    return nil, "a Lua string, but not an identifier shape: '" .. value .. "'"
   end
 
   local object = safe.to_managed_object(value)
@@ -758,39 +941,51 @@ function M.read_managed_string(value)
     return nil, "not a managed object (" .. type(value) .. ")"
   end
 
-  --- Reject anything that is clearly a rendered pointer rather than text.
-  local function usable(text)
-    return type(text) == "string"
-       and #text > 0
-       and not text:find("userdata", 1, true)
-       and not text:match("^0x")
+  local type_name = objects.type_name(object)
+  local tried = {}
+
+  --- Accept a candidate, or record what it actually was and move on.
+  local function take(route, candidate)
+    if looks_like_item_id(candidate) then
+      return candidate, route
+    end
+    tried[#tried + 1] = string.format("%s=%s", route, tostring(candidate))
+    return nil
   end
 
-  -- Route 1: REFramework's __tostring may already render the text.
-  local rendered = tostring(object)
-  if usable(rendered) then
-    return rendered, "tostring"
+  -- Route 1: tostring. In this build this renders the sol2 pointer, not the
+  -- text -- which is the trap described above. Recorded, not trusted.
+  local ok, text = take("tostring", tostring(object))
+  if ok ~= nil then
+    return ok, text
   end
 
   -- Route 2: ToString(), which for System.String returns itself.
   local via_call = objects.call(object, "ToString")
-  if type(via_call) == "string" and usable(via_call) then
-    return via_call, "ToString"
-  end
   if via_call ~= nil then
-    local second = tostring(via_call)
-    if usable(second) then
-      return second, "ToString then tostring"
+    ok, text = take("ToString", tostring(via_call))
+    if ok ~= nil then
+      return ok, text
     end
+  else
+    tried[#tried + 1] = "ToString=nil"
   end
 
-  return nil, "managed string could not be rendered"
+  return nil, string.format("no route yielded an identifier (object is %s): %s",
+                            tostring(type_name), table.concat(tried, " | "))
 end
 
 --- Find a carried item by its data ID.
 --
 -- Turns an item id arriving as a hook parameter into a real app.Item, so its
 -- category can be checked before anything is decided.
+--
+-- BOTH SIDES ARE NORMALISED. The id read off an app.Item and the id arriving
+-- as a hook argument can be represented differently -- one may be a Lua string
+-- while the other is a managed object -- and comparing those directly is never
+-- equal. Each is pushed through read_managed_string so the comparison happens
+-- in one representation.
+--
 -- @param item_data_id string
 -- @return userdata|nil app.Item
 function M.find_item_by_id(item_data_id)
@@ -803,13 +998,83 @@ function M.find_item_by_id(item_data_id)
     local item = objects.get(info, "Item")
     if item ~= nil then
       local id = objects.get(item, "ItemDataID")
-      if id == item_data_id then
-        return item
+
+      if type(id) == "string" then
+        if id == item_data_id then
+          return item
+        end
+      elseif id ~= nil then
+        local text = M.read_managed_string(id)
+        if text == item_data_id then
+          return item
+        end
       end
     end
   end
 
   return nil
+end
+
+--- Resolve a hook argument into a real carried app.Item, or nil.
+--
+-- WHY THIS EXISTS
+-- ---------------
+-- reduceItem's three parameters have never been identified individually. The
+-- earlier version assumed args[3] was the item id and read it as a string --
+-- an assumption that turned out to be load-bearing and wrong in effect, since
+-- the read silently produced a pointer rendering and every call passed
+-- through. Rather than assume a shape for the other two, each argument is
+-- offered here and resolved by what it actually IS.
+--
+-- Two shapes are tried, in order of safety:
+--
+--   1. An item id (a managed System.String naming a carried item).
+--   2. The app.Item object itself, classified directly -- no string decoding
+--      involved at all.
+--
+-- The object path demands an exact type-name match. A pointer that happened to
+-- look object-like and got blocked could consume a key item or desync the
+-- inventory, so anything not positively identified as app.Item is refused.
+--
+-- Fails closed: an unresolvable argument returns nil and the caller passes the
+-- call through.
+--
+-- @param value any  a raw hook argument
+-- @return userdata|nil app.Item
+-- @return string how it was resolved, or why it was not
+function M.resolve_hook_arg(value)
+  -- Path 1: the argument names a carried item.
+  local id, how = M.read_managed_string(value)
+  if id ~= nil then
+    local item = M.find_item_by_id(id)
+    if item ~= nil then
+      return item, string.format("id '%s' via %s", id, how)
+    end
+    return nil, string.format("id '%s' (%s) is not a carried item", id, how)
+  end
+
+  -- Path 2: the argument IS the item.
+  --
+  -- Only userdata/table values are considered. A primitive cannot be an
+  -- app.Item, and feeding a raw integer to to_managed_object would reinterpret
+  -- a count as a pointer -- which is exactly the kind of guess that turns a
+  -- trainer into a crash.
+  local kind = type(value)
+  if kind ~= "userdata" and kind ~= "table" then
+    return nil, string.format("%s: %s", kind, tostring(how))
+  end
+
+  local object = safe.to_managed_object(value)
+  if object == nil or not objects.is_valid(object) then
+    return nil, string.format("not a live object; %s", tostring(how))
+  end
+
+  local type_name = objects.type_name(object)
+  if type_name == "app.Item" then
+    return object, "the app.Item itself"
+  end
+
+  return nil, string.format("not an app.Item (%s); %s", tostring(type_name), tostring(how))
 end
 
 return M

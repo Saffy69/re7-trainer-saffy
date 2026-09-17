@@ -265,6 +265,60 @@ local function fake_inventory()
     end,
   }
 
+  --- A stand-in for one carried app.Item.
+  --
+  -- TWO items are returned by the list below, deliberately. TestHerb carries a
+  -- string category ("Drug"), which exercises the named-category gate. The
+  -- other carries a NUMBER, which is the shape the game actually reports and
+  -- the only shape the "conserve this category" control can act on.
+  local function make_item(id, category, max_stack)
+    local function item_data()
+      return {
+        get_type_definition = function()
+          return TYPE_DB["app.ItemData"]
+        end,
+        get_field = function(_, name)
+          if name == "Category" then return category end
+          if name == "MaxStackNum" then return max_stack end
+          return nil
+        end,
+        call = function() return nil end,
+      }
+    end
+
+    return {
+      get_type_definition = function()
+        return TYPE_DB["app.Item"]
+      end,
+      get_field = function(_, name)
+        if name == "ItemDataID" then return id end
+        if name == "_ItemData" then return item_data() end
+        return nil
+      end,
+      call = function(_, method)
+        if method == "get_ItemData" then return item_data() end
+        if method == "getStackNum" then return max_stack end
+        if method == "getMaxStackNum" then return max_stack end
+        if method == "setStackNum" then return true end
+        return nil
+      end,
+    }
+  end
+
+  --- A stand-in for one app.Inventory.ItemInfo entry.
+  local function make_item_info(id, category, max_stack)
+    return {
+      get_type_definition = function()
+        return { get_full_name = function() return "app.Inventory.ItemInfo" end }
+      end,
+      get_field = function(_, name)
+        if name == "Item" then return make_item(id, category, max_stack) end
+        return nil
+      end,
+      call = function() return nil end,
+    }
+  end
+
   return {
     get_type_definition = function()
       return { get_full_name = function() return "app.Inventory" end }
@@ -297,59 +351,15 @@ local function fake_inventory()
         -- One conservable item, so the inventory cheat's enable-time check has
         -- something to approve. Without it the cheat correctly refuses, which
         -- is right in game but leaves the hook path untested here.
+        --
+        -- TestCoin carries category value 9, a number this build could not
+        -- have derived -- the enum's members sort alphabetically in a
+        -- reflection listing, so names cannot be paired with numbers by
+        -- position. It stands for any category that is only knowable by
+        -- looking, which is what the opt-in control exists for.
         return {
-          {
-            get_type_definition = function()
-              return { get_full_name = function() return "app.Inventory.ItemInfo" end }
-            end,
-            get_field = function(_, f)
-              if f == "Item" then
-                return {
-                  get_type_definition = function()
-                    return TYPE_DB["app.Item"]
-                  end,
-                  get_field = function(_, n)
-                    if n == "ItemDataID" then return "TestHerb" end
-                    if n == "_ItemData" then
-                      return {
-                        get_type_definition = function()
-                          return TYPE_DB["app.ItemData"]
-                        end,
-                        get_field = function(_, m)
-                          if m == "Category" then return "Drug" end
-                          if m == "MaxStackNum" then return 3 end
-                          return nil
-                        end,
-                        call = function() return nil end,
-                      }
-                    end
-                    return nil
-                  end,
-                  call = function(_, m)
-                    if m == "get_ItemData" then
-                      return {
-                        get_type_definition = function()
-                          return TYPE_DB["app.ItemData"]
-                        end,
-                        get_field = function(_, n)
-                          if n == "Category" then return "Drug" end
-                          if n == "MaxStackNum" then return 3 end
-                          return nil
-                        end,
-                        call = function() return nil end,
-                      }
-                    end
-                    if m == "getStackNum" then return 3 end
-                    if m == "getMaxStackNum" then return 3 end
-                    if m == "setStackNum" then return true end
-                    return nil
-                  end,
-                }
-              end
-              return nil
-            end,
-            call = function() return nil end,
-          },
+          make_item_info("TestHerb", "Drug", 3),
+          make_item_info("TestCoin", 9, 1),
         }
       end
       return nil
@@ -764,15 +774,142 @@ do
   check("inventory gates reduceItem", reduce ~= nil)
 
   if reduce then
-    -- reduceItem identifies its item by an id string. With an unreadable id it
-    -- must pass through, because blocking an unidentifiable call could consume
-    -- a key item or desync the inventory.
-    check("reduceItem passes when the id is unreadable",
+    -- ---------------------------------------------------------------------
+    -- What an item id is allowed to look like.
+    --
+    -- This is the regression test for the bug that made Infinite Items do
+    -- nothing in game. The old check rejected text containing "userdata" or
+    -- starting with "0x" -- guesses about pointer formatting. This build
+    -- renders a sol2 pointer as "sol.REManagedObject*: <addr>", which passed,
+    -- was returned as the item id, and short-circuited the ToString routes
+    -- underneath. Every call then read "pass (item not found)".
+    -- ---------------------------------------------------------------------
+    local game = require("re7trainer.game")
+
+    check("a sol2 pointer rendering is refused as an item id",
+          game.looks_like_item_id("sol.REManagedObject*: 000000010BB92698") == false)
+    check("a hex address is refused as an item id",
+          game.looks_like_item_id("0x000000010BB92698") == false)
+    check("a real item id is accepted",
+          game.looks_like_item_id("ChemicalM") == true)
+    check("an underscored item id is accepted",
+          game.looks_like_item_id("Handgun_Bullet_01") == true)
+    check("an empty string is refused", game.looks_like_item_id("") == false)
+
+    --- A managed-string stand-in: renders as a POINTER under tostring(), but
+    --- answers ToString() with the real text.
+    --
+    -- This is the exact shape that broke in game. Under the old code route 1
+    -- "succeeded" with the pointer rendering and route 2 never ran, so the id
+    -- was never read. The point of the test is that ToString is now REACHED.
+    local function managed_string(text)
+      local object = {}
+      object.call = function(_, name)
+        if name == "ToString" then return text end
+        return nil
+      end
+      object.get_type_definition = function()
+        return { get_full_name = function() return "System.String" end }
+      end
+      return setmetatable(object, {
+        __tostring = function() return "sol.REManagedObject*: 000000010BB92698" end,
+      })
+    end
+
+    --- Same, but nothing can name it: tostring renders a pointer and ToString
+    --- yields nothing. Must be passed through untouched.
+    local function unnameable_object()
+      local object = {}
+      object.call = function() return nil end
+      object.get_type_definition = function()
+        return { get_full_name = function() return "System.String" end }
+      end
+      return setmetatable(object, {
+        __tostring = function() return "sol.REManagedObject*: 000000010BB92698" end,
+      })
+    end
+
+    -- The stub inventory carries a Drug item with ItemDataID "TestHerb", so a
+    -- resolvable id must produce SKIP_ORIGINAL -- the cheat actually acting.
+    check("reduceItem blocks a conservable item named by a managed string",
+          reduce.pre({ [1] = nil, [2] = nil, [3] = managed_string("TestHerb") })
+            == sdk.PreHookResult.SKIP_ORIGINAL)
+
+    -- An id naming an item that is not carried must not block.
+    check("reduceItem passes for an id that is not carried",
+          reduce.pre({ [1] = nil, [2] = nil, [3] = managed_string("NotInInventory") })
+            == sdk.PreHookResult.CALL_ORIGINAL)
+
+    -- No route names the argument: fail closed.
+    check("reduceItem passes when the argument cannot be named at all",
+          reduce.pre({ [1] = nil, [2] = nil, [3] = unnameable_object() })
+            == sdk.PreHookResult.CALL_ORIGINAL)
+
+    -- A bare pointer rendering handed over as a Lua string must not be
+    -- mistaken for an id.
+    check("reduceItem passes for a pointer rendering passed as a Lua string",
+          reduce.pre({ [1] = nil, [2] = nil, [3] = "sol.REManagedObject*: 000000010BB92698" })
+            == sdk.PreHookResult.CALL_ORIGINAL)
+
+    -- With an unreadable id it must pass through, because blocking an
+    -- unidentifiable call could consume a key item or desync the inventory.
+    check("reduceItem passes when no parameters arrive",
           reduce.pre({ [1] = nil, [2] = nil, [3] = nil }) == sdk.PreHookResult.CALL_ORIGINAL)
+
+    -- ---------------------------------------------------------------------
+    -- Opting a category in.
+    --
+    -- The gate is an allowlist of observed category VALUES, and only five were
+    -- ever established. TestCoin carries value 9 -- a number that could not be
+    -- derived, only looked at -- so it stands for every category the dump did
+    -- not cover. Opting it in must actually change what gets conserved.
+    -- ---------------------------------------------------------------------
+    local coin = game.find_item_by_id("TestCoin")
+    check("the numeric-category stub item is reachable by id", coin ~= nil)
+
+    local coin_safe_before = game.is_safe_to_conserve(coin)
+    check("an unopted category is not conserved", coin_safe_before == false)
+
+    local function coin_call()
+      return reduce.pre({ [1] = nil, [2] = nil, [3] = managed_string("TestCoin") })
+    end
+
+    check("reduceItem passes for an unopted category",
+          coin_call() == sdk.PreHookResult.CALL_ORIGINAL)
+
+    -- The three defaults are the reason the cheat works at all; a panel
+    -- control must not be able to switch them off.
+    check("a default category cannot be switched off",
+          game.set_category_conserved(2, false) == false and game.category_conserved(2) == true)
+
+    check("a non-numeric value is refused", game.set_category_conserved("9", true) == false)
+
+    check("category 9 can be opted in", game.set_category_conserved(9, true) == true)
+    check("category 9 now counts as conserved", game.category_conserved(9) == true)
+
+    local coin_safe_after = game.is_safe_to_conserve(coin)
+    check("the item is conserved once its category is opted in", coin_safe_after == true)
+
+    check("reduceItem now blocks that item",
+          coin_call() == sdk.PreHookResult.SKIP_ORIGINAL)
+
+    check("category 9 can be opted back out", game.set_category_conserved(9, false) == true)
+    check("category 9 is refused again", game.category_conserved(9) == false)
+    check("reduceItem passes again once opted out",
+          coin_call() == sdk.PreHookResult.CALL_ORIGINAL)
+
+    -- The panel's tick list is built from these, so a value in the inventory
+    -- has to show up in it or the control cannot offer it.
+    local saw_nine = false
+    for _, entry in ipairs(game.observed_categories()) do
+      if entry.value == 9 then saw_nine = true end
+    end
+    check("observed categories report the value carried in the inventory", saw_nine)
 
     inventory.disable()
     check("reduceItem passes while disabled",
-          reduce.pre({ [1] = nil, [2] = nil, [3] = nil }) == sdk.PreHookResult.CALL_ORIGINAL)
+          reduce.pre({ [1] = nil, [2] = nil, [3] = managed_string("TestHerb") })
+            == sdk.PreHookResult.CALL_ORIGINAL)
     inventory.enable()
   end
 end
