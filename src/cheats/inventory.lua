@@ -180,6 +180,14 @@ end
 -- because blocking the wrong one could consume a key item or desync the
 -- inventory.
 --
+-- CORRECTION: that paragraph described the intent, and for one in-game round it
+-- was not what the code did. The implementation read args[3] as an item id and
+-- ignored the other two parameters entirely -- and the id read itself silently
+-- returned a pointer rendering, so nothing was ever identified and nothing was
+-- ever blocked. Both halves are fixed; the note is kept because the doc said
+-- "each parameter is examined" while the code did not, and that gap is exactly
+-- what made the failure hard to see.
+--
 -- args layout, from the verified sdk.hook signature:
 --   args[1] = REThreadContext*, args[2] = `this` (the app.Inventory)
 --   args[3..] = parameters
@@ -195,36 +203,61 @@ local function on_reduce_item(args)
     return sdk.PreHookResult.CALL_ORIGINAL
   end
 
-  -- The item id arrives as a managed System.String in the first parameter.
-  -- Reading it is what makes this call gatable at all: without it we know only
-  -- that *something* is being reduced, and blocking on that would block
-  -- combining, discarding and puzzle handovers along with real use.
-  local item_id, how_read = game.read_managed_string(args[3])
+  -- EVERY parameter is examined, not just the first.
+  --
+  -- The previous version read args[3] as an item id and stopped there. It never
+  -- actually identified an item, either: the read returned a pointer rendering
+  -- ("sol.REManagedObject*: ..."), find_item_by_id looked for an item by that
+  -- name and found none, and the panel reported "pass (item not found)" on
+  -- every call while nothing was ever conserved. See game.read_managed_string
+  -- for that bug.
+  --
+  -- Each argument is now resolved by what it actually IS -- an item id, or the
+  -- app.Item object, or neither -- and the whole call is recorded, so the panel
+  -- shows what arrived even on the calls that are deliberately passed through.
+  --
+  -- reduceItem is declared with 3 parameters, so args[3..5] is the full set.
+  -- Iterating the known range rather than #args avoids depending on how
+  -- REFramework sizes the argument table.
+  local notes = {}
+  local blocked_by = nil
+  local saw_item = false
 
-  if item_id == nil then
-    last_args = "[3] unreadable (" .. tostring(how_read) .. ")"
-    safe.note_invocation(HOOK_KEY_REDUCE, "pass (id unreadable)")
-    return sdk.PreHookResult.CALL_ORIGINAL
+  for index = 3, 5 do
+    local value = args[index]
+    if value ~= nil then
+      local item, how = game.resolve_hook_arg(value)
+
+      if item ~= nil then
+        saw_item = true
+        local conservable, reason = game.is_safe_to_conserve(item)
+        notes[#notes + 1] = string.format("[%d] %s -> %s", index, how, tostring(reason))
+        if conservable then
+          blocked_by = string.format("[%d] %s", index, tostring(reason))
+        end
+      else
+        notes[#notes + 1] = string.format("[%d] %s", index, tostring(how))
+      end
+    end
   end
 
-  local item = game.find_item_by_id(item_id)
+  last_args = #notes > 0 and table.concat(notes, " | ") or "no parameters arrived"
 
-  if item == nil then
-    last_args = item_id .. " (not in inventory)"
-    safe.note_invocation(HOOK_KEY_REDUCE, "pass (item not found)")
-    return sdk.PreHookResult.CALL_ORIGINAL
-  end
-
-  local item_safe, reason = game.is_safe_to_conserve(item)
-  last_args = string.format("%s [%s] -> %s", item_id, tostring(how_read), tostring(reason))
-
-  if item_safe then
+  if blocked_by ~= nil then
     blocks = blocks + 1
-    safe.note_invocation(HOOK_KEY_REDUCE, "SKIP (" .. tostring(reason) .. ")")
+    safe.note_invocation(HOOK_KEY_REDUCE, "SKIP (" .. blocked_by .. ")")
     return sdk.PreHookResult.SKIP_ORIGINAL
   end
 
-  safe.note_invocation(HOOK_KEY_REDUCE, "pass (" .. tostring(reason) .. ")")
+  if saw_item then
+    -- The call was identified and deliberately allowed: a key item, a weapon,
+    -- or something the classification gate will not vouch for.
+    safe.note_invocation(HOOK_KEY_REDUCE, "pass (identified, not conservable)")
+  else
+    -- Nothing in the call could be named. Fail closed -- blocking an
+    -- unidentifiable call could consume a key item or desync the inventory.
+    safe.note_invocation(HOOK_KEY_REDUCE, "pass (no argument identified)")
+  end
   return sdk.PreHookResult.CALL_ORIGINAL
 end
 
