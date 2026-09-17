@@ -7,7 +7,7 @@ Offline, single-player, no external process. It does not scan memory, use Cheat 
 fixed offsets, or touch save files. Everything it does goes through the game's own objects, using
 routes that were read out of a running copy of RE7 rather than guessed at.
 
-> **The rule this was built under:** do not invent RE7 APIs, and do not claim a cheat works unless
+> **The rule this was built under:** not to invent RE7 APIs, not to claim a cheat works unless
 > it has been verified against the actual game. Everything below is written to that standard, which
 > is why some of it is more cautious than you might expect.
 
